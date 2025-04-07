@@ -1,0 +1,14 @@
+{
+  "devDependencies": {
+    "@types/node": "^22.14.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.8.3"
+  },
+"scripts": {
+  "stagehand": "cd aeroml-browserbase && node --loader ts-node/esm index.ts"
+},
+  "ts-node": {
+    "esm": true,
+    "experimentalSpecifierResolution": "node"
+  }
+}

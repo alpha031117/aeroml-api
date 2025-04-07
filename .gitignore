@@ -1,0 +1,11 @@
+/env
+# /__pycache__/
+__pycache__
+/config
+.env
+node_modules
+tmp
+downloads
+.DS_Store
+dist
+cache.json
