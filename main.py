@@ -26,8 +26,8 @@ ML recommendations, and performance reports are automatically saved to local fil
 for easy retrieval without relying on H2O sessions.
 """
 
-from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request, HTTPException, APIRouter
+from fastapi.responses import StreamingResponse, FileResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 import subprocess
@@ -39,11 +39,8 @@ import os
 import logging
 from generate_LoRa_dataset import suggest_sources
 from pathlib import Path
-from fastapi.responses import FileResponse
 import pandas as pd
-from utils import list_dataset_name
-from fastapi import HTTPException
-from utils import DATASETS_DIR
+from utils import list_dataset_name, DATASETS_DIR
 from typing import Optional
 
 # Import the pipeline function
@@ -62,6 +59,19 @@ from datetime import datetime
 from typing import Dict, Any, Optional
 import json
 from pathlib import Path
+
+app = FastAPI(
+    title="AeroML API",
+    description="FastAPI application for dataset elicitation and H2O ML pipelines",
+    version="1.0.0",
+    openapi_tags=[
+        {"name": "dataset-elicitation", "description": "Discover/prepare datasets & utilities"},
+        {"name": "model-training", "description": "Run H2O pipelines, manage sessions & results"},
+    ],
+)
+
+dataset_router = APIRouter(tags=["dataset-elicitation"])
+h2o_router = APIRouter(tags=["model-training"])
 
 # Global session storage (in production, use a proper database)
 h2o_sessions: Dict[str, Dict[str, Any]] = {}
@@ -135,8 +145,6 @@ def save_session_data_to_files(session_id: str, session_data: Dict[str, Any]) ->
 if sys.platform.startswith("win"):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-app = FastAPI()
-
 # Allow CORS for specific origin
 origins = [
     "http://localhost:3000",  # React frontend
@@ -152,13 +160,7 @@ app.add_middleware(
     allow_headers=["*"],  # Allows all headers
 )
 
-# @app.get("/")
-# def read_root():
-#     query = "Weather Prediction at Malaysia"
-#     sources = suggest_sources(query)
-#     return {"sources": sources}
-
-@app.post("/suggest-sources")
+@dataset_router.post("/suggest-sources")
 async def suggest_sources_endpoint(request: Request):
     try:
         data = await request.json()
@@ -183,7 +185,7 @@ async def suggest_sources_endpoint(request: Request):
             "status": 500
         }
 
-@app.get("/datasets")
+@dataset_router.get("/datasets")
 async def get_dataset(filename: Optional[str] = None, limit: int = None, offset: int = 0):
     """
     Return a CSV (as JSON) for tabular display.
@@ -238,11 +240,54 @@ async def get_dataset(filename: Optional[str] = None, limit: int = None, offset:
         # Fall back to 500 with details
         raise HTTPException(status_code=500, detail=f"Error processing {filename}: {e}")
 
-@app.get("/model-training")
+@dataset_router.get("/run-stagehand")
+def run_stagehand_script(request: Request):
+    print("🔥 Starting subprocess...")
+    def generate():
+        context = None
+
+        # Use full path to `npx.cmd` on Windows
+        project_root = r"D:\alpha\Documents\PSM-AeroML\aeroml-api"  # <-- adjust
+        npm_cmd = shutil.which("npm") or r"C:\Program Files\nodejs\npm.cmd"
+
+        try:
+            process = subprocess.Popen(
+                [npm_cmd, "run", "stagehand", "--silent"],
+                cwd=project_root,            # <-- IMPORTANT
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                bufsize=1,
+                universal_newlines=True
+            )
+
+            for line in iter(process.stdout.readline, ''):
+                if not line:
+                    break
+
+                decoded = line.strip()
+                yield f"LOG: {decoded}\n"
+
+                try:
+                    parsed = json.loads(decoded)
+                    if isinstance(parsed, dict) and parsed.get("type") == "final_output":
+                        context = parsed.get("context")
+                        yield f"\n\nFINAL_CONTEXT: {json.dumps(context, indent=2)}\n"
+                except json.JSONDecodeError:
+                    pass
+
+            process.stdout.close()
+            process.wait()
+
+        except Exception as e:
+            yield f"\n🔥 Error: {str(e)}\n"
+
+    return StreamingResponse(generate(), media_type="text/plain")
+
+@h2o_router.get("/model-training")
 def model_training(request: Request):
     return {"message": "Model training started"}
 
-@app.get("/h2o-ml-pipeline-status")
+@h2o_router.get("/h2o-ml-pipeline-status")
 def h2o_ml_pipeline_status():
     """
     Check if H2O ML pipeline is available and ready to use.
@@ -282,7 +327,7 @@ def h2o_ml_pipeline_status():
             "message": "Error checking H2O ML Pipeline status"
         }
 
-@app.get("/run-h2o-ml-pipeline")
+@h2o_router.get("/run-h2o-ml-pipeline")
 def run_h2o_ml_pipeline_endpoint(
     request: Request,
     data_path: str,
@@ -469,7 +514,7 @@ def run_h2o_ml_pipeline_endpoint(
     
     return StreamingResponse(generate(), media_type="text/plain")
 
-@app.get("/h2o-leaderboard/{session_id}")
+@h2o_router.get("/h2o-leaderboard/{session_id}")
 def get_h2o_leaderboard(session_id: str):
     """
     Get the model leaderboard and ML recommendations for a specific H2O training session.
@@ -621,7 +666,7 @@ def get_h2o_leaderboard(session_id: str):
             detail=f"Error retrieving leaderboard for session {session_id}: {str(e)}"
         )
 
-@app.get("/h2o-ml-recommendations/{session_id}")
+@h2o_router.get("/h2o-ml-recommendations/{session_id}")
 def get_h2o_ml_recommendations(session_id: str):
     """
     Get ML recommendations for a specific H2O training session from local files.
@@ -720,7 +765,7 @@ def get_h2o_ml_recommendations(session_id: str):
             detail=f"Error retrieving ML recommendations for session {session_id}: {str(e)}"
         )
 
-@app.get("/h2o-sessions")
+@h2o_router.get("/h2o-sessions")
 def list_h2o_sessions():
     """
     List all available H2O training sessions.
@@ -757,7 +802,7 @@ def list_h2o_sessions():
             detail=f"Error listing sessions: {str(e)}"
         )
 
-@app.delete("/h2o-sessions/{session_id}")
+@h2o_router.delete("/h2o-sessions/{session_id}")
 def delete_h2o_session(session_id: str):
     """
     Delete a specific H2O training session.
@@ -799,7 +844,7 @@ def delete_h2o_session(session_id: str):
             detail=f"Error deleting session {session_id}: {str(e)}"
         )
 
-@app.get("/h2o-session-data/{session_id}")
+@h2o_router.get("/h2o-session-data/{session_id}")
 def get_h2o_session_data_from_files(session_id: str):
     """
     Retrieve H2O session data from local files.
@@ -864,7 +909,7 @@ def get_h2o_session_data_from_files(session_id: str):
             detail=f"Error retrieving session data for {session_id}: {str(e)}"
         )
 
-@app.get("/h2o-session-data")
+@h2o_router.get("/h2o-session-data")
 def list_h2o_session_data_directories():
     """
     List all available H2O session data directories.
@@ -918,7 +963,7 @@ def list_h2o_session_data_directories():
             detail=f"Error listing session data directories: {str(e)}"
         )
 
-@app.get("/h2o-cluster-info")
+@h2o_router.get("/h2o-cluster-info")
 def get_h2o_cluster_info():
     """
     Get information about the current H2O cluster status.
@@ -958,7 +1003,7 @@ def get_h2o_cluster_info():
             detail=f"Error getting H2O cluster info: {str(e)}"
         )
 
-@app.post("/run-h2o-ml-pipeline-advanced")
+@h2o_router.post("/run-h2o-ml-pipeline-advanced")
 async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
     """
     Run H2O ML pipeline with advanced configuration via POST request.
@@ -1184,47 +1229,5 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
     
     return StreamingResponse(generate(), media_type="text/plain")
 
-
-
-@app.get("/run-stagehand")
-def run_stagehand_script(request: Request):
-    print("🔥 Starting subprocess...")
-    def generate():
-        context = None
-
-        # Use full path to `npx.cmd` on Windows
-        project_root = r"D:\alpha\Documents\PSM-AeroML\aeroml-api"  # <-- adjust
-        npm_cmd = shutil.which("npm") or r"C:\Program Files\nodejs\npm.cmd"
-
-        try:
-            process = subprocess.Popen(
-                [npm_cmd, "run", "stagehand", "--silent"],
-                cwd=project_root,            # <-- IMPORTANT
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                bufsize=1,
-                universal_newlines=True
-            )
-
-            for line in iter(process.stdout.readline, ''):
-                if not line:
-                    break
-
-                decoded = line.strip()
-                yield f"LOG: {decoded}\n"
-
-                try:
-                    parsed = json.loads(decoded)
-                    if isinstance(parsed, dict) and parsed.get("type") == "final_output":
-                        context = parsed.get("context")
-                        yield f"\n\nFINAL_CONTEXT: {json.dumps(context, indent=2)}\n"
-                except json.JSONDecodeError:
-                    pass
-
-            process.stdout.close()
-            process.wait()
-
-        except Exception as e:
-            yield f"\n🔥 Error: {str(e)}\n"
-
-    return StreamingResponse(generate(), media_type="text/plain")
+app.include_router(dataset_router, prefix="")
+app.include_router(h2o_router, prefix="")
