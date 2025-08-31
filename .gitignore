@@ -10,6 +10,7 @@ downloads
 dist
 cache.json
 
-/ai_functions
 app.log
 /h2o_models
+/session_data
+ai_functions/
