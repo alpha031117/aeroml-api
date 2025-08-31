@@ -9,3 +9,7 @@ downloads
 .DS_Store
 dist
 cache.json
+
+/ai_functions
+app.log
+/h2o_models

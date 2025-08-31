@@ -1,130 +1,146 @@
-import { Stagehand, Page, BrowserContext } from "@browserbasehq/stagehand";
-import StagehandConfig from "./stagehand.config.js";
-import chalk from "chalk";
-import boxen from "boxen";
-import { drawObserveOverlay, clearOverlays, actWithCache } from "./utils.js";
+/* eslint-disable */
+import "dotenv/config";
+
+import { createServer } from "@inngest/agent-kit/server";
+import { Inngest } from "inngest";
+import {
+  createAgent,
+  createNetwork,
+  createRoutingAgent,
+  createTool,
+  openai,
+  State,
+} from "@inngest/agent-kit";
 import { z } from "zod";
+import Browserbase from "@browserbasehq/sdk";
 
-/**
- * 🤘 Welcome to Stagehand! Thanks so much for trying us out!
- * 🛠️ CONFIGURATION: stagehand.config.ts will help you configure Stagehand
- *
- * 📝 Check out our docs for more fun use cases, like building agents
- * https://docs.stagehand.dev/
- *
- * 💬 If you have any feedback, reach out to us on Slack!
- * https://stagehand.dev/slack
- *
- * 📚 You might also benefit from the docs for Zod, Browserbase, and Playwright:
- * - https://zod.dev/
- * - https://docs.browserbase.com/
- * - https://playwright.dev/docs/intro
- */
-async function main({
-  page,
-  context,
-  stagehand,
-}: {
-  page: Page; // Playwright Page with act, extract, and observe methods
-  context: BrowserContext; // Playwright BrowserContext
-  stagehand: Stagehand; // Stagehand instance
-}) : Promise<BrowserContext>{
-  // Navigate to a URL
-  await page.goto("https://docs.stagehand.dev/reference/introduction");
+import { getStagehand, isLastMessageOfType, lastResult } from "./utils.js";
+import { navigate, extract, act, observe } from "./stagehand-tools.js";
 
-  // Use act() to take actions on the page
-  await page.act("Click the search box");
+const bb = new Browserbase({
+  apiKey: process.env.BROWSERBASE_API_KEY as string,
+});
 
-  // Use observe() to plan an action before doing it
-  const [action] = await page.observe(
-    "Type 'Tell me in one sentence why I should use Stagehand' into the search box",
-  );
-  await drawObserveOverlay(page, [action]); // Highlight the search box
-  await page.waitForTimeout(1000);
-  await clearOverlays(page); // Remove the highlight before typing
-  await page.act(action); // Take
+const webSearchAgent = createAgent({
+  name: "web_search_agent",
+  description: "I am a web search agent.",
+  system: `You are a web search agent.
+  `,
+  tools: [navigate, extract, act, observe],
+});
 
-  // For more on caching, check out our docs: https://docs.stagehand.dev/examples/caching
-  await actWithCache(page, "Click the suggestion to use AI");
-  await page.waitForTimeout(4000);
+const supervisorRoutingAgent = createRoutingAgent({
+  name: "Supervisor",
+  description: "I am a Research supervisor.",
+  system: `You are a research supervisor.
+Your goal is to search for information linked to the user request by augmenting your own research with the "web_search_agent" agent.
 
-  // Use extract() to extract structured data from the page
-  const { text } = await page.extract({
-    instruction:
-      "extract the text of the AI suggestion from the search results",
-    schema: z.object({
-      text: z.string(),
+Think step by step and reason through your decision.
+
+When the answer is found, call the "done" agent.`,
+  model: openai({
+    model: "gpt-4o",
+  }),
+  tools: [
+    createTool({
+      name: "route_to_agent",
+      description: "Invoke an agent to perform a task",
+      parameters: z.object({
+        agent: z.string().describe("The agent to invoke"),
+      }),
+      handler: async ({ agent }) => {
+        return agent;
+      },
     }),
-  });
-  stagehand.log({
-    category: "create-browser-app",
-    message: `Got AI Suggestion`,
-    auxiliary: {
-      text: {
-        value: text,
-        type: "string",
-      },
+  ],
+  tool_choice: "route_to_agent",
+  lifecycle: {
+    onRoute: ({ result, network }) => {
+      const lastMessage = lastResult(network?.state.results);
+
+      // ensure to loop back to the last executing agent if a tool has been called
+      if (lastMessage && isLastMessageOfType(lastMessage, "tool_call")) {
+        return [lastMessage?.agent.name];
+      }
+
+      const tool = result.toolCalls[0];
+      if (!tool) {
+        return;
+      }
+      const toolName = tool.tool.name;
+      if (toolName === "done") {
+        return;
+      } else if (toolName === "route_to_agent") {
+        if (
+          typeof tool.content === "object" &&
+          tool.content !== null &&
+          "data" in tool.content &&
+          typeof tool.content.data === "string"
+        ) {
+          return [tool.content.data];
+        }
+      }
+      return;
     },
-  });
-  stagehand.log({
-    category: "create-browser-app",
-    message: `Metrics`,
-    auxiliary: {
-      metrics: {
-        value: JSON.stringify(stagehand.metrics),
-        type: "object",
-      },
-    },
-  });
+  },
+});
 
-  return context; // Ensure the function returns a BrowserContext
-}
+// Create a network with the agents and default router
+const searchNetwork = createNetwork({
+  name: "Simple Search Network",
+  agents: [webSearchAgent],
+  maxIter: 15,
+  defaultModel: openai({
+    model: "gpt-4o",
+  }),
+  defaultRouter: supervisorRoutingAgent,
+});
 
-/**
- * This is the main function that runs when you do npm run start
- *
- * YOU PROBABLY DON'T NEED TO MODIFY ANYTHING BELOW THIS POINT!
- *
- */
-async function run() {
-  const stagehand = new Stagehand({
-    ...StagehandConfig,
-  });
-  await stagehand.init();
+const inngest = new Inngest({
+  id: "Simple Search Agent",
+});
 
-  if (StagehandConfig.env === "BROWSERBASE" && stagehand.browserbaseSessionID) {
-    console.log(
-      boxen(
-        `View this session live in your browser: \n${chalk.blue(
-          `https://browserbase.com/sessions/${stagehand.browserbaseSessionID}`,
-        )}`,
-        {
-          title: "Browserbase",
-          padding: 1,
-          margin: 3,
-        },
-      ),
+const simpleSearchWorkflow = inngest.createFunction(
+  {
+    id: "simple-search-agent-workflow",
+  },
+  {
+    event: "app/support.ticket.created",
+  },
+  async ({ step, event }) => {
+    const browserbaseSessionID = await step.run(
+      "create_browserbase_session",
+      async () => {
+        const session = await bb.sessions.create({
+          projectId: process.env.BROWSERBASE_PROJECT_ID as string,
+          keepAlive: true,
+        });
+        return session.id;
+      }
     );
+
+    const response = await searchNetwork.run(event.data.input, {
+      state: new State({
+        browserbaseSessionID,
+      }),
+    });
+
+    await step.run("close-browserbase-session", async () => {
+      const stagehand = await getStagehand(browserbaseSessionID);
+      await stagehand.close();
+    });
+
+    return {
+      response,
+    };
   }
+);
 
-  const page = stagehand.page;
-  const context = stagehand.context;
-  const returnedContext = await main({ page, context, stagehand }); // 👈 get returned context
+// Create and start the server
+const server = createServer({
+  functions: [simpleSearchWorkflow as any],
+});
 
-  // await main({
-  //   page,
-  //   context,
-  //   stagehand,
-  // });
-  await stagehand.close();
-  console.log(
-    `\n🤘 Thanks so much for using Stagehand! Reach out to us on Slack if you have any feedback: ${chalk.blue(
-      "https://stagehand.dev/slack",
-    )}\n`,
-  );
-
-    return returnedContext; // 👈 optional: return it from run too if needed elsewhere
-
-}
-
-run();
+server.listen(3010, () =>
+  console.log("Simple search Agent demo server is running on port 3010")
+);

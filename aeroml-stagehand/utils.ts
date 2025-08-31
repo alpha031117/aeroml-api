@@ -1,171 +1,100 @@
-import { ObserveResult, Page } from "@browserbasehq/stagehand";
-import boxen from "boxen";
-import chalk from "chalk";
-import fs from "fs/promises";
 import { z } from "zod";
+import { Stagehand } from "@browserbasehq/stagehand";
+import {
+  TextMessage,
+  ToolCallMessage,
+  ToolResultMessage,
+} from "@inngest/agent-kit";
+import { InferenceResult } from "@inngest/agent-kit";
 
-export function announce(message: string, title?: string) {
-  console.log(
-    boxen(message, {
-      padding: 1,
-      margin: 3,
-      title: title || "Stagehand",
-    }),
-  );
-}
-
-/**
- * Get an environment variable and throw an error if it's not found
- * @param name - The name of the environment variable
- * @returns The value of the environment variable
- */
-export function getEnvVar(name: string, required = true): string | undefined {
-  const value = process.env[name];
-  if (!value && required) {
-    throw new Error(`${name} not found in environment variables`);
-  }
-  return value;
-}
-
-/**
- * Validate a Zod schema against some data
- * @param schema - The Zod schema to validate against
- * @param data - The data to validate
- * @returns Whether the data is valid against the schema
- */
-export function validateZodSchema(schema: z.ZodTypeAny, data: unknown) {
-  try {
-    schema.parse(data);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-export async function drawObserveOverlay(page: Page, results: ObserveResult[]) {
-  // Convert single xpath to array for consistent handling
-  const xpathList = results.map((result) => result.selector);
-
-  // Filter out empty xpaths
-  const validXpaths = xpathList.filter((xpath) => xpath !== "xpath=");
-
-  await page.evaluate((selectors) => {
-    selectors.forEach((selector) => {
-      let element;
-      if (selector.startsWith("xpath=")) {
-        const xpath = selector.substring(6);
-        element = document.evaluate(
-          xpath,
-          document,
-          null,
-          XPathResult.FIRST_ORDERED_NODE_TYPE,
-          null,
-        ).singleNodeValue;
-      } else {
-        element = document.querySelector(selector);
-      }
-
-      if (element instanceof HTMLElement) {
-        const overlay = document.createElement("div");
-        overlay.setAttribute("stagehandObserve", "true");
-        const rect = element.getBoundingClientRect();
-        overlay.style.position = "absolute";
-        overlay.style.left = rect.left + "px";
-        overlay.style.top = rect.top + "px";
-        overlay.style.width = rect.width + "px";
-        overlay.style.height = rect.height + "px";
-        overlay.style.backgroundColor = "rgba(255, 255, 0, 0.3)";
-        overlay.style.pointerEvents = "none";
-        overlay.style.zIndex = "10000";
-        document.body.appendChild(overlay);
-      }
-    });
-  }, validXpaths);
-}
-
-export async function clearOverlays(page: Page) {
-  // remove existing stagehandObserve attributes
-  await page.evaluate(() => {
-    const elements = document.querySelectorAll('[stagehandObserve="true"]');
-    elements.forEach((el) => {
-      const parent = el.parentNode;
-      while (el.firstChild) {
-        parent?.insertBefore(el.firstChild, el);
-      }
-      parent?.removeChild(el);
-    });
+export async function getStagehand(sessionId: string) {
+  const stagehand = new Stagehand({
+    env: "BROWSERBASE",
+    apiKey: process.env.BROWSERBASE_API_KEY,
+    projectId: process.env.BROWSERBASE_PROJECT_ID,
+    browserbaseSessionID: sessionId,
+    modelName: "gpt-4o",
+    modelClientOptions: {
+      apiKey: process.env.OPENAI_API_KEY,
+    },
   });
+  await stagehand.init();
+  return stagehand;
 }
 
-export async function simpleCache(
-  instruction: string,
-  actionToCache: ObserveResult,
-) {
-  // Save action to cache.json
-  try {
-    // Read existing cache if it exists
-    let cache: Record<string, ObserveResult> = {};
-    try {
-      const existingCache = await fs.readFile("cache.json", "utf-8");
-      cache = JSON.parse(existingCache);
-    } catch (error) {
-      // File doesn't exist yet, use empty cache
+export const StagehandAvailableModelSchema = z.enum([
+  "gpt-4o",
+  "gpt-4o-mini",
+  "gpt-4o-2024-11-20",
+  "gpt-4o-2024-08-06",
+  "gpt-4o-2024-05-13",
+  "claude-3-5-sonnet-latest",
+  "claude-3-5-sonnet-20241022",
+  "claude-3-5-sonnet-20240620",
+  "claude-3-7-sonnet-20250219",
+  "o1-mini",
+  "o1-preview",
+  "o3-mini",
+]);
+
+// Transform string such as "{ lastFundraiseDate: string, amount: string, round: string }" into a zod schema
+export function stringToZodSchema(schema: string) {
+  // Remove whitespace and curly braces
+  const trimmed = schema.replace(/\s/g, "").slice(1, -1);
+
+  // Split into individual field definitions
+  const fields = trimmed.split(",");
+
+  // Build object shape
+  const shape: Record<string, z.ZodType> = {};
+
+  for (const field of fields) {
+    const [key, type] = field.split(":");
+
+    // Check if type is an array (ends with [])
+    const isArray = type.endsWith("[]");
+    const baseType = isArray ? type.slice(0, -2) : type;
+
+    let zodType: z.ZodType;
+    switch (baseType) {
+      case "string":
+        zodType = z.string();
+        break;
+      case "number":
+        zodType = z.number();
+        break;
+      case "boolean":
+        zodType = z.boolean();
+        break;
+      case "date":
+        zodType = z.date();
+        break;
+      default:
+        zodType = z.string(); // Default to string for unknown types
     }
 
-    // Add new action to cache
-    cache[instruction] = actionToCache;
-
-    // Write updated cache to file
-    await fs.writeFile("cache.json", JSON.stringify(cache, null, 2));
-  } catch (error) {
-    console.error(chalk.red("Failed to save to cache:"), error);
+    // Wrap in array if needed
+    shape[key] = isArray ? z.array(zodType) : zodType;
   }
+
+  return z.object(shape);
 }
 
-export async function readCache(
-  instruction: string,
-): Promise<ObserveResult | null> {
-  try {
-    const existingCache = await fs.readFile("cache.json", "utf-8");
-    const cache: Record<string, ObserveResult> = JSON.parse(existingCache);
-    return cache[instruction] || null;
-  } catch (error) {
-    return null;
+export function lastResult(results: InferenceResult[] | undefined) {
+  if (!results) {
+    return undefined;
   }
+  return results[results.length - 1];
 }
 
-/**
- * This function is used to act with a cacheable action.
- * It will first try to get the action from the cache.
- * If not in cache, it will observe the page and cache the result.
- * Then it will execute the action.
- * @param instruction - The instruction to act with.
- */
-export async function actWithCache(
-  page: Page,
-  instruction: string,
-): Promise<void> {
-  // Try to get action from cache first
-  const cachedAction = await readCache(instruction);
-  if (cachedAction) {
-    console.log(chalk.blue("Using cached action for:"), instruction);
-    await page.act(cachedAction);
-    return;
-  }
+type MessageType =
+  | TextMessage["type"]
+  | ToolCallMessage["type"]
+  | ToolResultMessage["type"];
 
-  // If not in cache, observe the page and cache the result
-  const results = await page.observe(instruction);
-  console.log(chalk.blue("Got results:"), results);
-
-  // Cache the playwright action
-  const actionToCache = results[0];
-  console.log(chalk.blue("Taking cacheable action:"), actionToCache);
-  await simpleCache(instruction, actionToCache);
-  // OPTIONAL: Draw an overlay over the relevant xpaths
-  await drawObserveOverlay(page, results);
-  await page.waitForTimeout(1000); // Can delete this line, just a pause to see the overlay
-  await clearOverlays(page);
-
-  // Execute the action
-  await page.act(actionToCache);
+export function isLastMessageOfType(
+  result: InferenceResult,
+  type: MessageType
+) {
+  return result.output[result.output.length - 1]?.type === type;
 }

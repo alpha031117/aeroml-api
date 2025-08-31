@@ -2,13 +2,21 @@
   "devDependencies": {
     "@types/node": "^22.14.0",
     "ts-node": "^10.9.2",
-    "typescript": "^5.8.3"
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.2"
   },
-"scripts": {
-  "stagehand": "cd aeroml-browserbase && node --loader ts-node/esm index.ts"
-},
+  "type": "module",
+  "scripts": {
+    "stagehand": "tsx aeroml-stagehand/index.ts"
+  },
   "ts-node": {
     "esm": true,
     "experimentalSpecifierResolution": "node"
+  },
+  "dependencies": {
+    "@browserbasehq/stagehand": "^2.1.0",
+    "boxen": "^8.0.1",
+    "chalk": "^5.4.1",
+    "zod": "^3.24.3"
   }
 }
