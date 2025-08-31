@@ -9,8 +9,6 @@ from typing import Dict, Any
 
 h2o_router = APIRouter(tags=["model-training"])
 
-
-
 @h2o_router.get("/model-training")
 def model_training(request: Request):
     return {"message": "Model training started"}
@@ -678,3 +676,5 @@ def get_h2o_ml_recommendations(session_id: str):
             status_code=500,
             detail=f"Error retrieving ML recommendations for session {session_id}: {str(e)}"
         )
+
+
