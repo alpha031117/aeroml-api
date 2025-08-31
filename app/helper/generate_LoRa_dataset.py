@@ -4,7 +4,7 @@ import re
 
 import openai
 import google.generativeai as genai
-from utils import extract_urls, convert_size_to_bytes, logger
+from app.helper.utils import extract_urls, convert_size_to_bytes, logger
 import pandas as pd
 from dotenv import load_dotenv
 from dataset_elicitation_agent.utils import _extract_json, _soft_repair_json
