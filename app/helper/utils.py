@@ -74,6 +74,14 @@ def list_dataset_name() -> str:
     csvs.sort(key=lambda p: p.stat().st_mtime, reverse=True)
     return csvs[0].name  # e.g., "mydata.csv"
 
+# Get model path from session data
+def get_model_path_from_session_data(session_id: str) -> str:
+    session_dir = SESSION_DATA_DIR / session_id
+    session_file = session_dir / "session_data.json"
+    with open(session_file, 'r') as f:
+        session_data = json.load(f)
+    return session_data.get('model_path')
+
 def save_session_data_to_files(session_id: str, session_data: Dict[str, Any]) -> Dict[str, str]:
         """
         Save session data to local files for easy retrieval.

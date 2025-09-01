@@ -53,6 +53,7 @@ from h2o_machine_learning_agent.h2o_ml_pipeline import (
 # Add session management imports
 from datetime import datetime
 
+import uvicorn
 from app.api.dataset_controller import dataset_router
 from app.api.model_training_controller import h2o_router
 from app.api.h2o_utils_controller import h2o_utils_router

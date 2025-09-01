@@ -388,6 +388,39 @@ def evaluate_model_performance(model, verbose: bool = True) -> Dict[str, Any]:
         return None
 
 
+def evaluate_model_performance_from_path(model_path: str, verbose: bool = True):
+    """
+    Initialize H2O, load a model from the given path, and return its performance.
+
+    Parameters:
+    -----------
+    model_path : str
+        Full path to a saved H2O model directory or ID that h2o.load_model can load
+    verbose : bool
+        Whether to print progress information
+
+    Returns:
+    --------
+    The H2O model performance object, or None on error.
+    """
+    try:
+        if verbose:
+            print("Initializing H2O and loading model for performance evaluation...")
+
+        # Initialize H2O (no-op if already initialized)
+        try:
+            h2o.init()
+        except Exception:
+            pass
+
+        model = h2o.load_model(model_path)
+        return model.model_performance()
+    except Exception as e:
+        if verbose:
+            print(f"Error evaluating model performance from path '{model_path}': {e}")
+        return None
+
+
 def shutdown_h2o():
     """
     Shutdown H2O cluster.
@@ -744,4 +777,3 @@ def get_active_h2o_models(verbose: bool = True) -> Dict[str, Any]:
             'error': str(e),
             'message': 'Failed to get active H2O models'
         }
-
