@@ -6,18 +6,12 @@ import json
 import pandas as pd
 import h2o
 from h2o_machine_learning_agent.h2o_ml_pipeline import run_h2o_ml_pipeline, evaluate_model_performance_from_path, predict_with_model
-from app.helper.utils import DATASETS_DIR, save_session_data_to_files, h2o_sessions, get_model_path_from_session_data, SESSION_DATA_DIR
-from typing import Dict, Any, List
+from app.helper.utils import save_session_data_to_files, h2o_sessions, get_model_path_from_session_data, SESSION_DATA_DIR
+from typing import Dict, Any
 from pathlib import Path
 from langchain_openai import ChatOpenAI
-from langchain_community.llms import Ollama
-import re
 
 h2o_router = APIRouter(tags=["model-training"])
-
-@h2o_router.get("/model-training")
-def model_training(request: Request):
-    return {"message": "Model training started"}
 
 @h2o_router.get("/run-h2o-ml-pipeline")
 def run_h2o_ml_pipeline_endpoint(
@@ -240,12 +234,12 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
         
         # Extract parameters with defaults
         config = {
-            "data_path": data.get("data_path", "datasets/churn_data.csv"),
-            "target_variable": data.get("target_variable", "Churn"),
+            "data_path": data.get("data_path"),
+            "target_variable": data.get("target_variable"),
             "max_runtime_secs": data.get("max_runtime_secs", 30),
             "model_name": data.get("model_name", "gpt-oss:20b"),
             "user_instructions": data.get("user_instructions", ""),
-            "exclude_columns": data.get("exclude_columns", ["customerID"]),
+            "exclude_columns": data.get("exclude_columns"),
             "return_predictions": data.get("return_predictions", True),
             "return_leaderboard": data.get("return_leaderboard", True),
             "return_performance": data.get("return_performance", True)
@@ -254,6 +248,58 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
         # Use default instructions if not provided
         if not config["user_instructions"]:
             config["user_instructions"] = f"Please do classification on '{config['target_variable']}'. Use a max runtime of {config['max_runtime_secs']} seconds."
+        
+        # Check data validity
+        if not config["data_path"]:
+            return {"error": "Data path is required", "status": 400}
+        if not config["target_variable"]:
+            return {"error": "Target variable is required", "status": 400}
+        if not config["exclude_columns"]:
+            return {"error": "Exclude columns are required", "status": 400}
+        if not config["return_predictions"]:
+            return {"error": "Return predictions is required", "status": 400}
+        if not config["return_leaderboard"]:
+            return {"error": "Return leaderboard is required", "status": 400}
+        if not config["return_performance"]:
+            return {"error": "Return performance is required", "status": 400}
+        if not config["max_runtime_secs"]:
+            return {"error": "Max runtime is required", "status": 400}
+        if not config["model_name"]:
+            return {"error": "Model name is required", "status": 400}
+        if not config["user_instructions"]:
+            return {"error": "User instructions are required", "status": 400}
+        
+        # Check if data path exists
+        if not Path(config["data_path"]).exists():
+            return {"error": "Data path does not exist", "status": 400}
+        
+        # Check if target variable exists in data
+        if not config["target_variable"] in pd.read_csv(config["data_path"]).columns:
+            return {"error": "Target variable does not exist in data", "status": 400}
+        
+        # Check if exclude columns exist in data
+        if not all(col in pd.read_csv(config["data_path"]).columns for col in config["exclude_columns"]):
+            return {"error": "Exclude columns do not exist in data", "status": 400}
+        
+        # Check if model name is valid
+        if not config["model_name"] in ["gpt-oss:20b", "gpt-4o-mini"]:
+            return {"error": "Model name is not valid", "status": 400}
+        
+        # Check if user instructions are valid
+        if not config["user_instructions"]:
+            return {"error": "User instructions are not valid", "status": 400}
+        
+        # Check if max runtime is valid
+        if not config["max_runtime_secs"] > 0:
+            return {"error": "Max runtime is not valid", "status": 400}
+        
+        # Check if return predictions is valid
+        if not isinstance(config["return_predictions"], bool):
+            return {"error": "Return predictions is not valid", "status": 400}
+        if not isinstance(config["return_leaderboard"], bool):
+            return {"error": "Return leaderboard is not valid", "status": 400}
+        if not isinstance(config["return_performance"], bool):
+            return {"error": "Return performance is not valid", "status": 400}
         
     except json.JSONDecodeError:
         # Return error for invalid JSON
@@ -743,7 +789,7 @@ def get_model_info(session_id: str):
                     "message": f"Error getting model info for session {session_id}: {str(e)}"
                 }
         return {
-            "session_id": session_id,
+            "session_id": session_id,   
             "type": details_performance.get('__meta').get('schema_type'),
             "name": details_performance.get('__meta').get('schema_name')
         }
@@ -760,13 +806,12 @@ class ModelChatBot:
     A chatbot interface for interacting with deployed H2O models through natural language.
     """
     
-    def __init__(self, session_id: str, model_name: str = "gpt-oss:20b"):
+    def __init__(self, session_id: str, model_name: str = "gpt-4o-mini"):
         self.session_id = session_id
         self.model_path = None
         self.h2o_model = None
         self.session_data = None
-        # self.llm = Ollama(model=model_name)
-        self.llm = ChatOpenAI(model="gpt-4o-mini")
+        self.llm = ChatOpenAI(model=model_name)
         self.chat_history = []
         self.model_info = {}
         self.details_performance = {}
@@ -829,44 +874,44 @@ class ModelChatBot:
         try:
             # Use LLM to understand the user's intent and extract data
             system_prompt = f"""
-You are an AI assistant helping users interact with a machine learning model.
+                You are an AI assistant helping users interact with a machine learning model.
 
-Model Information:
-- Model ID: {self.model_info.get('model_id', 'Unknown')}
-- Algorithm: {self.details_performance.get('__meta').get('schema_name')}
-- Target Variable: {self.model_info.get('target_variable', 'Unknown')}
-- Data Source: {self.model_info.get('data_path', 'Unknown')}
+                Model Information:
+                - Model ID: {self.model_info.get('model_id', 'Unknown')}
+                - Algorithm: {self.details_performance.get('__meta').get('schema_name')}
+                - Target Variable: {self.model_info.get('target_variable', 'Unknown')}
+                - Data Source: {self.model_info.get('data_path', 'Unknown')}
 
-Your task is to:
-1. Determine if the user wants to make a prediction
-2. Extract any data values they provided
-3. Ask for missing required information
-4. Check if the question is related to this specific model
-5. Format the response as JSON
+                Your task is to:
+                1. Determine if the user wants to make a prediction
+                2. Extract any data values they provided
+                3. Ask for missing required information
+                4. Check if the question is related to this specific model
+                5. Format the response as JSON
 
-IMPORTANT: You MUST respond with ONLY valid JSON. Do not include any text before or after the JSON.
+                IMPORTANT: You MUST respond with ONLY valid JSON. Do not include any text before or after the JSON.
 
-Respond with JSON in this exact format:
-{{
-    "intent": "prediction" | "question" | "help" | "unrelated",
-    "has_data": true/false,
-    "data": {{"column_name": "value", ...}},
-    "missing_info": ["list", "of", "missing", "columns"],
-    "response": "your response to the user"
-}}
+                Respond with JSON in this exact format:
+                {{
+                    "intent": "prediction" | "question" | "help" | "unrelated",
+                    "has_data": true/false,
+                    "data": {{"column_name": "value", ...}},
+                    "missing_info": ["list", "of", "missing", "columns"],
+                    "response": "your response to the user"
+                }}
 
-If the user asks about topics unrelated to this specific model (like general AI, other models, weather, news, etc.), set intent to "unrelated" and provide a polite message explaining you only help with this specific model.
+                If the user asks about topics unrelated to this specific model (like general AI, other models, weather, news, etc.), set intent to "unrelated" and provide a polite message explaining you only help with this specific model.
 
-Examples:
-- If user says "I want to predict churn for age=35, income=75000, tenure=24", respond:
-{{"intent": "prediction", "has_data": true, "data": {{"age": "35", "income": "75000", "tenure": "24"}}, "missing_info": [], "response": "I'll make a prediction with the provided data."}}
+                Examples:
+                - If user says "I want to predict churn for age=35, income=75000, tenure=24", respond:
+                {{"intent": "prediction", "has_data": true, "data": {{"age": "35", "income": "75000", "tenure": "24"}}, "missing_info": [], "response": "I'll make a prediction with the provided data."}}
 
-- If user asks "What does this model do?", respond:
-{{"intent": "question", "has_data": false, "data": {{}}, "missing_info": [], "response": "This model predicts {self.model_info.get('target_variable', 'target')} using {self.details_performance.get('__meta').get('schema_name')}."}}
+                - If user asks "What does this model do?", respond:
+                {{"intent": "question", "has_data": false, "data": {{}}, "missing_info": [], "response": "This model predicts {self.model_info.get('target_variable', 'target')} using {self.details_performance.get('__meta').get('schema_name')}."}}
 
-- If user asks "What's the weather today?" or "Tell me about ChatGPT", respond:
-{{"intent": "unrelated", "has_data": false, "data": {{}}, "missing_info": [], "response": "I'm a specialized chatbot for the {self.details_performance.get('__meta').get('schema_name')} model that predicts {self.model_info.get('target_variable', 'target values')}. I can only help you with questions related to this specific model, such as making predictions, understanding model performance, or asking about the training data. Please ask me something related to this model."}}
-"""
+                - If user asks "What's the weather today?" or "Tell me about ChatGPT", respond:
+                {{"intent": "unrelated", "has_data": false, "data": {{}}, "missing_info": [], "response": "I'm a specialized chatbot for the {self.details_performance.get('__meta').get('schema_name')} model that predicts {self.model_info.get('target_variable', 'target values')}. I can only help you with questions related to this specific model, such as making predictions, understanding model performance, or asking about the training data. Please ask me something related to this model."}}
+                """
             
             user_prompt = f"User input: {user_input}"
             
@@ -1154,6 +1199,7 @@ async def model_chat_endpoint(session_id: str, request: Request):
                 "status": 400
             }
         
+        print(f"User input: {user_input}")
         # Initialize or get existing chatbot
         chatbot = ModelChatBot(session_id)
         init_result = chatbot.initialize()
@@ -1167,6 +1213,8 @@ async def model_chat_endpoint(session_id: str, request: Request):
         
         # Process the chat message
         chat_response = chatbot.chat(user_input)
+
+        print(f"Chat response: {chat_response}")
         
         return chat_response
         
@@ -1255,9 +1303,9 @@ def model_deployment(session_id: str):
         # Generate AI-powered prompts based on actual dataset
         def generate_ai_prompts(target_var, algorithm, features, data_path, use_case):
             try:
-                # Initialize Ollama for AI prompt generation
-                from langchain_community.llms import Ollama
-                llm = Ollama(model="qwen2:7b")
+                # Initialize OpenAI for AI prompt generation
+                from langchain_openai import ChatOpenAI
+                llm = ChatOpenAI(model="gpt-4o-mini")
                 
                 # Load and analyze the dataset
                 dataset_info = analyze_dataset(data_path, target_var, features)

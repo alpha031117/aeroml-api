@@ -26,35 +26,17 @@ ML recommendations, and performance reports are automatically saved to local fil
 for easy retrieval without relying on H2O sessions.
 """
 
-from fastapi import FastAPI, Request, HTTPException, APIRouter
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-
-import json
 import asyncio
 import sys
-import os
-import logging
-from pathlib import Path
-import pandas as pd
-from app.helper.utils import list_dataset_name, DATASETS_DIR
-from typing import Dict, Any, Optional
+from dotenv import load_dotenv
 
-# Import the pipeline function
-from h2o_machine_learning_agent.h2o_ml_pipeline import (
-    run_h2o_ml_pipeline, 
-    shutdown_h2o,
-    get_leaderboard_from_session,
-    get_active_h2o_models,
-    get_h2o_session_info,
-    keep_h2o_session_alive
-)
-
-# Add session management imports
-from datetime import datetime
+# Load environment variables from .env file
+load_dotenv()
 
 import uvicorn
-from app.api.dataset_controller import dataset_router
+# from app.api.dataset_controller import dataset_router
 from app.api.model_training_controller import h2o_router
 from app.api.h2o_utils_controller import h2o_utils_router
 
@@ -64,7 +46,6 @@ def get_application() -> FastAPI:
     description="FastAPI application for dataset elicitation and H2O ML pipelines",
     version="1.0.0",
     openapi_tags=[
-        {"name": "dataset-elicitation", "description": "Discover/prepare datasets & utilities"},
         {"name": "model-training", "description": "Run H2O pipelines, manage sessions & results"},
     ],
     )
@@ -88,7 +69,7 @@ def get_application() -> FastAPI:
         allow_headers=["*"],
     )
 
-    application.include_router(dataset_router, prefix="/api/dataset")
+    # application.include_router(dataset_router, prefix="/api/dataset")
     application.include_router(h2o_router, prefix="/api/model-training")
     application.include_router(h2o_utils_router, prefix="/api/model-training-utils")
 
@@ -98,7 +79,7 @@ def get_application() -> FastAPI:
 app = get_application()
 
 if __name__ == '__main__':
-    uvicorn.run("app.main:app", host="0.0.0.0", port=8080, reload=True, log_level="debug")
+    uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True, log_level="debug")
 
 
 
