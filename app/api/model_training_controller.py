@@ -522,8 +522,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
 @h2o_router.get("/h2o-leaderboard/{session_id}")
 def get_h2o_leaderboard(session_id: str):
     """
-    Get the model leaderboard and ML recommendations for a specific H2O training session.
-    Prioritizes local file storage over active H2O sessions for faster retrieval.
+    Get the model leaderboard for a specific H2O training session from local files.
     
     Parameters:
     -----------
@@ -533,135 +532,44 @@ def get_h2o_leaderboard(session_id: str):
     Returns:
     --------
     Dict[str, Any]
-        Dictionary containing the leaderboard, ML recommendations, and session information
+        Dictionary containing the leaderboard data
     """
     try:
-        # First try to get data from local files (fastest)
+        # Get leaderboard from local file
         session_dir = SESSION_DATA_DIR / session_id
+        leaderboard_file = session_dir / "leaderboard.json"
         
-        if session_dir.exists():
-            session_data = {}
-            
-            # Load leaderboard data from local file
-            leaderboard_file = session_dir / "leaderboard.json"
-            if leaderboard_file.exists():
-                with open(leaderboard_file, 'r') as f:
-                    session_data['leaderboard'] = json.load(f)
-            
-            # Load ML recommendations from local file
-            recommendations_file = session_dir / "ml_recommendations.txt"
-            if recommendations_file.exists():
-                with open(recommendations_file, 'r', encoding='utf-8') as f:
-                    session_data['ml_recommendations'] = f.read()
-            
-            # Load performance metrics from local file
-            performance_file = session_dir / "performance.json"
-            if performance_file.exists():
-                with open(performance_file, 'r') as f:
-                    session_data['performance'] = json.load(f)
-            
-            # Load complete session data from local file
-            session_file = session_dir / "session_data.json"
-            if session_file.exists():
-                with open(session_file, 'r') as f:
-                    complete_session_data = json.load(f)
-                    
-                    # Extract key information
-                    session_data.update({
-                        "session_id": complete_session_data.get('session_id'),
-                        "created_at": complete_session_data.get('created_at'),
-                        "status": complete_session_data.get('status'),
-                        "data_path": complete_session_data.get('data_path'),
-                        "target_variable": complete_session_data.get('target_variable'),
-                        "max_runtime_secs": complete_session_data.get('max_runtime_secs'),
-                        "model_name": complete_session_data.get('model_name'),
-                        "model_path": complete_session_data.get('model_path'),
-                        "num_models": complete_session_data.get('num_models', 0)
-                    })
-            
-            # Check if we have leaderboard data
-            if session_data.get('leaderboard'):
-                return {
-                    "session_id": session_id,
-                    "status": "success",
-                    "source": "local_files",
-                    "created_at": session_data.get('created_at'),
-                    "data_path": session_data.get('data_path'),
-                    "target_variable": session_data.get('target_variable'),
-                    "max_runtime_secs": session_data.get('max_runtime_secs'),
-                    "model_name": session_data.get('model_name'),
-                    "model_path": session_data.get('model_path'),
-                    "num_models": session_data.get('num_models', 0),
-                    "performance": session_data.get('performance'),
-                    "leaderboard": session_data['leaderboard'],
-                    "ml_recommendations": session_data.get('ml_recommendations'),
-                    "data_available": list(session_data.keys())
-                }
-            else:
-                return {
-                    "session_id": session_id,
-                    "status": "partial_data",
-                    "source": "local_files",
-                    "message": "Session data found but leaderboard not available",
-                    "data_available": list(session_data.keys()),
-                    "ml_recommendations": session_data.get('ml_recommendations')
+        if not leaderboard_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Leaderboard not found for session {session_id}"
+            )
+        
+        # Load leaderboard data
+        with open(leaderboard_file, 'r') as f:
+            leaderboard_data = json.load(f)
+        
+        # Optionally load session metadata
+        session_metadata = {}
+        session_file = session_dir / "session_data.json"
+        if session_file.exists():
+            with open(session_file, 'r') as f:
+                session_info = json.load(f)
+                session_metadata = {
+                    "session_id": session_info.get('session_id'),
+                    "created_at": session_info.get('created_at'),
+                    "data_path": session_info.get('data_path'),
+                    "target_variable": session_info.get('target_variable'),
+                    "max_runtime_secs": session_info.get('max_runtime_secs'),
+                    "model_path": session_info.get('model_path')
                 }
         
-        # Fallback: Try to get leaderboard from active H2O session
-        try:
-            leaderboard_result = get_leaderboard_from_session(session_id)
-            
-            if leaderboard_result['status'] == 'success':
-                # Successfully retrieved from active session
-                return {
-                    "session_id": session_id,
-                    "status": "success",
-                    "source": "active_h2o_session",
-                    "leaderboard": leaderboard_result['leaderboard'],
-                    "best_model_id": leaderboard_result['best_model_id'],
-                    "performance_metrics": leaderboard_result['performance_metrics'],
-                    "num_models": leaderboard_result['num_models'],
-                    "h2o_session_info": leaderboard_result['h2o_session_info']
-                }
-        except Exception as e:
-            # Log the error but continue to next fallback
-            print(f"Warning: Could not retrieve from active H2O session: {e}")
-        
-        # Final fallback: Check stored session data in memory
-        if session_id in h2o_sessions:
-            session_data = h2o_sessions[session_id]
-            
-            # Check if session completed successfully
-            if session_data['status'] == 'completed':
-                return {
-                    "session_id": session_id,
-                    "status": "success",
-                    "source": "memory_session_data",
-                    "created_at": session_data['created_at'],
-                    "data_path": session_data['data_path'],
-                    "target_variable": session_data['target_variable'],
-                    "max_runtime_secs": session_data['max_runtime_secs'],
-                    "model_name": session_data['model_name'],
-                    "model_path": session_data['model_path'],
-                    "num_models": session_data.get('num_models', 0),
-                    "performance": session_data.get('performance'),
-                    "leaderboard": session_data.get('leaderboard'),
-                    "ml_recommendations": session_data.get('ml_recommendations')
-                }
-            else:
-                return {
-                    "session_id": session_id,
-                    "status": session_data['status'],
-                    "source": "memory_session_data",
-                    "error": session_data.get('error', 'Session did not complete successfully'),
-                    "message": f"Session {session_id} status: {session_data['status']}"
-                }
-        
-        # If not found anywhere, return error
-        raise HTTPException(
-            status_code=404,
-            detail=f"Session {session_id} not found in local files, active H2O session, or memory"
-        )
+        return {
+            "session_id": session_id,
+            "status": "success",
+            "leaderboard": leaderboard_data,
+            **session_metadata
+        }
         
     except HTTPException:
         raise
