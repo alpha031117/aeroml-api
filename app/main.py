@@ -37,6 +37,7 @@ load_dotenv()
 
 import uvicorn
 # from app.api.dataset_controller import dataset_router
+from app.api.dataset_controller import dataset_validation_router
 from app.api.model_training_controller import h2o_router
 from app.api.h2o_utils_controller import h2o_utils_router
 
@@ -46,6 +47,7 @@ def get_application() -> FastAPI:
     description="FastAPI application for dataset elicitation and H2O ML pipelines",
     version="1.0.0",
     openapi_tags=[
+        {"name": "dataset-validation", "description": "Validate datasets using OpenAI for training suitability"},
         {"name": "model-training", "description": "Run H2O pipelines, manage sessions & results"},
     ],
     )
@@ -70,6 +72,7 @@ def get_application() -> FastAPI:
     )
 
     # application.include_router(dataset_router, prefix="/api/dataset")
+    application.include_router(dataset_validation_router, prefix="/api/dataset")
     application.include_router(h2o_router, prefix="/api/model-training")
     application.include_router(h2o_utils_router, prefix="/api/model-training-utils")
 
