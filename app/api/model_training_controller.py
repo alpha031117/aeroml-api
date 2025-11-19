@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, HTTPException
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form
 from fastapi.responses import StreamingResponse
 import uuid
 from datetime import datetime
@@ -7,7 +7,7 @@ import pandas as pd
 import h2o
 from h2o_machine_learning_agent.h2o_ml_pipeline import run_h2o_ml_pipeline, evaluate_model_performance_from_path, predict_with_model
 from app.helper.utils import save_session_data_to_files, h2o_sessions, get_model_path_from_session_data, SESSION_DATA_DIR
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 from pathlib import Path
 from langchain_openai import ChatOpenAI
 
@@ -224,93 +224,109 @@ def run_h2o_ml_pipeline_endpoint(
     return StreamingResponse(generate(), media_type="text/plain")
 
 @h2o_router.post("/run-h2o-ml-pipeline-advanced")
-async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
+async def run_h2o_ml_pipeline_advanced_endpoint(
+    file: UploadFile = File(..., description="Dataset file (.xlsx, .xls, or .csv)"),
+    target_variable: str = Form(..., description="Target column name"),
+    max_runtime_secs: int = Form(30, description="Maximum training time in seconds"),
+    model_name: str = Form("gpt-4o-mini", description="Model name for AI agent (gpt-4o-mini or gpt-oss:20b)"),
+    user_instructions: Optional[str] = Form(None, description="Custom instructions for the model (optional)"),
+    exclude_columns: Optional[str] = Form(None, description="Comma-separated list of columns to exclude (optional)"),
+    return_predictions: bool = Form(True, description="Return predictions"),
+    return_leaderboard: bool = Form(True, description="Return leaderboard"),
+    return_performance: bool = Form(True, description="Return performance metrics")
+):
     """
     Run H2O ML pipeline with advanced configuration via POST request.
-    Accepts JSON configuration and returns real-time execution logs.
+    Accepts multipart/form-data with file upload (Excel or CSV) and configuration parameters.
+    Returns real-time execution logs.
     """
     try:
-        data = await request.json()
+        # Validate file type
+        filename = file.filename
+        if not filename.endswith(('.xlsx', '.xls', '.csv')):
+            return {"error": "Only Excel (.xlsx, .xls) or CSV (.csv) files are supported", "status": 400}
         
-        # Extract parameters with defaults
+        # Parse exclude columns
+        exclude_columns_list = [col.strip() for col in exclude_columns.split(",") if col.strip()] if exclude_columns else []
+        
+        # Set default user instructions if not provided
+        if not user_instructions:
+            user_instructions = f"Please do classification on '{target_variable}'. Use a max runtime of {max_runtime_secs} seconds."
+        
+        # Create temporary directory for uploaded file
+        from app.helper.utils import DATASETS_DIR
+        temp_dir = DATASETS_DIR / "temp"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Generate unique filename
+        session_id = str(uuid.uuid4())
+        temp_filename = f"temp_{session_id}_{filename}"
+        temp_file_path = temp_dir / temp_filename
+        
+        # Save uploaded file
+        file_content = await file.read()
+        with open(temp_file_path, "wb") as f:
+            f.write(file_content)
+        
+        # Read file and convert to CSV if needed
+        try:
+            # Check if file is CSV or Excel
+            if filename.endswith('.csv'):
+                # Read CSV directly
+                df = pd.read_csv(temp_file_path)
+                csv_file_path = temp_file_path
+            else:
+                # Read Excel and convert to CSV
+                df = pd.read_excel(temp_file_path)
+                csv_filename = temp_filename.replace('.xlsx', '.csv').replace('.xls', '.csv')
+                csv_file_path = temp_dir / csv_filename
+                df.to_csv(csv_file_path, index=False)
+            
+            # Validate target variable exists
+            if target_variable not in df.columns:
+                return {
+                    "error": f"Target variable '{target_variable}' not found in file. Available columns: {', '.join(df.columns)}",
+                    "status": 400
+                }
+            
+            # Validate exclude columns exist
+            if exclude_columns_list:
+                invalid_cols = [col for col in exclude_columns_list if col not in df.columns]
+                if invalid_cols:
+                    return {
+                        "error": f"Exclude columns not found: {', '.join(invalid_cols)}. Available columns: {', '.join(df.columns)}",
+                        "status": 400
+                    }
+            
+        except Exception as e:
+            return {"error": f"Failed to read file: {str(e)}", "status": 400}
+        
+        # Validate model name
+        if model_name not in ["gpt-oss:20b", "gpt-4o-mini"]:
+            return {"error": "Model name must be 'gpt-oss:20b' or 'gpt-4o-mini'", "status": 400}
+        
+        # Validate max runtime
+        if max_runtime_secs <= 0:
+            return {"error": "Max runtime must be greater than 0", "status": 400}
+        
+        # Build config
         config = {
-            "data_path": data.get("data_path"),
-            "target_variable": data.get("target_variable"),
-            "max_runtime_secs": data.get("max_runtime_secs", 30),
-            "model_name": data.get("model_name", "gpt-oss:20b"),
-            "user_instructions": data.get("user_instructions", ""),
-            "exclude_columns": data.get("exclude_columns"),
-            "return_predictions": data.get("return_predictions", True),
-            "return_leaderboard": data.get("return_leaderboard", True),
-            "return_performance": data.get("return_performance", True)
+            "data_path": str(csv_file_path),
+            "original_filename": filename,
+            "target_variable": target_variable,
+            "max_runtime_secs": max_runtime_secs,
+            "model_name": model_name,
+            "user_instructions": user_instructions,
+            "exclude_columns": exclude_columns_list,
+            "return_predictions": return_predictions,
+            "return_leaderboard": return_leaderboard,
+            "return_performance": return_performance
         }
         
-        # Use default instructions if not provided
-        if not config["user_instructions"]:
-            config["user_instructions"] = f"Please do classification on '{config['target_variable']}'. Use a max runtime of {config['max_runtime_secs']} seconds."
-        
-        # Check data validity
-        if not config["data_path"]:
-            return {"error": "Data path is required", "status": 400}
-        if not config["target_variable"]:
-            return {"error": "Target variable is required", "status": 400}
-        if not config["exclude_columns"]:
-            return {"error": "Exclude columns are required", "status": 400}
-        if not config["return_predictions"]:
-            return {"error": "Return predictions is required", "status": 400}
-        if not config["return_leaderboard"]:
-            return {"error": "Return leaderboard is required", "status": 400}
-        if not config["return_performance"]:
-            return {"error": "Return performance is required", "status": 400}
-        if not config["max_runtime_secs"]:
-            return {"error": "Max runtime is required", "status": 400}
-        if not config["model_name"]:
-            return {"error": "Model name is required", "status": 400}
-        if not config["user_instructions"]:
-            return {"error": "User instructions are required", "status": 400}
-        
-        # Check if data path exists
-        if not Path(config["data_path"]).exists():
-            return {"error": "Data path does not exist", "status": 400}
-        
-        # Check if target variable exists in data
-        if not config["target_variable"] in pd.read_csv(config["data_path"]).columns:
-            return {"error": "Target variable does not exist in data", "status": 400}
-        
-        # Check if exclude columns exist in data
-        if not all(col in pd.read_csv(config["data_path"]).columns for col in config["exclude_columns"]):
-            return {"error": "Exclude columns do not exist in data", "status": 400}
-        
-        # Check if model name is valid
-        if not config["model_name"] in ["gpt-oss:20b", "gpt-4o-mini"]:
-            return {"error": "Model name is not valid", "status": 400}
-        
-        # Check if user instructions are valid
-        if not config["user_instructions"]:
-            return {"error": "User instructions are not valid", "status": 400}
-        
-        # Check if max runtime is valid
-        if not config["max_runtime_secs"] > 0:
-            return {"error": "Max runtime is not valid", "status": 400}
-        
-        # Check if return predictions is valid
-        if not isinstance(config["return_predictions"], bool):
-            return {"error": "Return predictions is not valid", "status": 400}
-        if not isinstance(config["return_leaderboard"], bool):
-            return {"error": "Return leaderboard is not valid", "status": 400}
-        if not isinstance(config["return_performance"], bool):
-            return {"error": "Return performance is not valid", "status": 400}
-        
-    except json.JSONDecodeError:
-        # Return error for invalid JSON
-        return {"error": "Invalid JSON in request body", "status": 400}
     except Exception as e:
         return {"error": f"Error parsing request: {str(e)}", "status": 400}
     
-    # Generate session ID for this training run
-    session_id = str(uuid.uuid4())
-    
-    print(f"🚀 Starting Advanced H2O ML Pipeline with config: {config}")
+    print(f"🚀 Starting Advanced H2O ML Pipeline with uploaded file: {filename}")
     
     def generate():
         try:
@@ -319,7 +335,9 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
             
             yield "LOG: Starting Advanced H2O Machine Learning Pipeline...\n"
             yield f"LOG: Session ID: {session_id}\n"
-            yield f"LOG: Configuration - Data: {config['data_path']}, Target: {config['target_variable']}, Runtime: {config['max_runtime_secs']}s\n"
+            yield f"LOG: Uploaded File: {config['original_filename']}\n"
+            yield f"LOG: Dataset Shape: {len(df)} rows × {len(df.columns)} columns\n"
+            yield f"LOG: Configuration - Target: {config['target_variable']}, Runtime: {config['max_runtime_secs']}s\n"
             
             # Run the pipeline with custom configuration
             results = run_h2o_ml_pipeline(
@@ -402,6 +420,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
                     "created_at": datetime.now().isoformat(),
                     "status": "completed",
                     "data_path": config['data_path'],
+                    "original_filename": config['original_filename'],
+                    "dataset_shape": {"rows": len(df), "columns": len(df.columns)},
                     "target_variable": config['target_variable'],
                     "max_runtime_secs": config['max_runtime_secs'],
                     "model_name": config['model_name'],
@@ -454,6 +474,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
                     "created_at": datetime.now().isoformat(),
                     "status": "failed",
                     "data_path": config['data_path'],
+                    "original_filename": config.get('original_filename'),
                     "target_variable": config['target_variable'],
                     "max_runtime_secs": config['max_runtime_secs'],
                     "model_name": config['model_name'],
@@ -483,6 +504,17 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
                 yield "LOG: 🧹 H2O cluster shutdown successfully\n"
             except Exception as e:
                 yield f"LOG: ⚠️ Warning: Could not shutdown H2O cluster: {e}\n"
+            
+            # Cleanup temporary files
+            try:
+                if temp_file_path.exists():
+                    temp_file_path.unlink()
+                # Only delete CSV file if it's different from the uploaded file
+                if csv_file_path != temp_file_path and csv_file_path.exists():
+                    csv_file_path.unlink()
+                yield "LOG: 🧹 Temporary files cleaned up\n"
+            except Exception as e:
+                yield f"LOG: ⚠️ Warning: Could not cleanup temporary files: {e}\n"
                 
         except Exception as e:
             error_msg = f"🔥 Error in Advanced H2O ML Pipeline: {str(e)}"
@@ -494,6 +526,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(request: Request):
                 "created_at": datetime.now().isoformat(),
                 "status": "error",
                 "data_path": config.get('data_path'),
+                "original_filename": config.get('original_filename'),
                 "target_variable": config.get('target_variable'),
                 "max_runtime_secs": config.get('max_runtime_secs'),
                 "model_name": config.get('model_name'),
@@ -577,6 +610,88 @@ def get_h2o_leaderboard(session_id: str):
         raise HTTPException(
             status_code=500,
             detail=f"Error retrieving leaderboard for session {session_id}: {str(e)}"
+        )
+
+@h2o_router.get("/model-performance/{session_id}")
+def get_model_performance(session_id: str):
+    """
+    Get detailed model performance metrics for a specific H2O training session from local files.
+    
+    Parameters:
+    -----------
+    session_id : str
+        The session ID from a previous H2O ML pipeline run
+        
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary containing detailed performance metrics including:
+        - Model metadata (algorithm, model category)
+        - Performance metrics (MSE, RMSE, R2, AUC, LogLoss, etc.)
+        - Confusion matrix
+        - Thresholds and metric scores
+        - Gains/Lift table
+        - Residual and null deviance
+    """
+    try:
+        # Get performance details from local file
+        session_dir = SESSION_DATA_DIR / session_id
+        performance_file = session_dir / "details_performance.json"
+        
+        if not performance_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Performance details not found for session {session_id}"
+            )
+        
+        # Load performance data
+        with open(performance_file, 'r') as f:
+            performance_data = json.load(f)
+        
+        # Extract key metrics for easy access
+        key_metrics = {
+            "model_name": performance_data.get("model", {}).get("name"),
+            "model_category": performance_data.get("model_category"),
+            "algorithm": performance_data.get("__meta", {}).get("schema_name"),
+            "MSE": performance_data.get("MSE"),
+            "RMSE": performance_data.get("RMSE"),
+            "R2": performance_data.get("r2"),
+            "AUC": performance_data.get("AUC"),
+            "PR_AUC": performance_data.get("pr_auc"),
+            "LogLoss": performance_data.get("logloss"),
+            "Gini": performance_data.get("Gini"),
+            "AIC": performance_data.get("AIC"),
+            "mean_per_class_error": performance_data.get("mean_per_class_error"),
+            "nobs": performance_data.get("nobs")
+        }
+        
+        # Optionally load session metadata
+        session_metadata = {}
+        session_file = session_dir / "session_data.json"
+        if session_file.exists():
+            with open(session_file, 'r') as f:
+                session_info = json.load(f)
+                session_metadata = {
+                    "session_id": session_info.get('session_id'),
+                    "created_at": session_info.get('created_at'),
+                    "target_variable": session_info.get('target_variable'),
+                    "data_path": session_info.get('data_path')
+                }
+        
+        return {
+            "session_id": session_id,
+            "status": "success",
+            "key_metrics": key_metrics,
+            "full_performance_details": performance_data,
+            **session_metadata
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving performance details for session {session_id}: {str(e)}"
         )
 
 @h2o_router.get("/h2o-ml-recommendations/{session_id}")

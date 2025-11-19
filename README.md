@@ -9,6 +9,7 @@ AeroML API provides a comprehensive REST API for building, training, and deployi
 ## ✨ Features
 
 - **🤖 H2O AutoML Integration**: Automated machine learning pipeline with real-time execution logs
+- **📤 File Upload**: Upload Excel (.xlsx, .xls) or CSV files directly for model training
 - **💬 AI-Powered Chat Interface**: Interact with trained models using natural language (powered by OpenAI)
 - **📊 Session Management**: Track and retrieve training sessions with unique session IDs
 - **🎯 Model Deployment**: Easy model deployment with AI-generated test prompts
@@ -16,6 +17,7 @@ AeroML API provides a comprehensive REST API for building, training, and deployi
 - **🗂️ Dataset Management**: Built-in dataset handling and suggestions
 - **🔄 Real-time Streaming**: Live updates during model training
 - **💾 Persistent Storage**: Local file-based session data storage
+- **🧹 Auto Cleanup**: Automatic cleanup of temporary files after processing
 
 ## 🛠️ Tech Stack
 
@@ -96,21 +98,62 @@ GET /api/model-training/run-h2o-ml-pipeline
 
 **Response:** Server-sent events stream with real-time training progress
 
-#### Run Advanced H2O ML Pipeline
+#### Run Advanced H2O ML Pipeline (with File Upload)
 ```http
 POST /api/model-training/run-h2o-ml-pipeline-advanced
 ```
-**Request Body:**
-```json
-{
-  "data_path": "datasets/churn_data.csv",
-  "target_variable": "Churn",
-  "max_runtime_secs": 300,
-  "max_models": 20,
-  "nfolds": 5,
-  "seed": 42
-}
+**Content-Type:** `multipart/form-data`
+
+**Form Data Parameters:**
+- `file` (required): Dataset file (.xlsx, .xls, or .csv)
+- `target_variable` (required): Target column name
+- `max_runtime_secs` (optional): Maximum training time in seconds (default: 30)
+- `model_name` (optional): Model name - "gpt-4o-mini" or "gpt-oss:20b" (default: "gpt-4o-mini")
+- `user_instructions` (optional): Custom instructions for the model
+- `exclude_columns` (optional): Comma-separated list of columns to exclude
+- `return_predictions` (optional): Return predictions - "true" or "false" (default: "true")
+- `return_leaderboard` (optional): Return leaderboard - "true" or "false" (default: "true")
+- `return_performance` (optional): Return performance metrics - "true" or "false" (default: "true")
+
+**Example using cURL (Excel):**
+```bash
+curl -X POST "http://127.0.0.1:8000/api/model-training/run-h2o-ml-pipeline-advanced" \
+  -F "file=@/path/to/your/dataset.xlsx" \
+  -F "target_variable=Churn" \
+  -F "max_runtime_secs=300" \
+  -F "model_name=gpt-4o-mini" \
+  -F "exclude_columns=customerID,unnecessary_column"
 ```
+
+**Example using cURL (CSV):**
+```bash
+curl -X POST "http://127.0.0.1:8000/api/model-training/run-h2o-ml-pipeline-advanced" \
+  -F "file=@/path/to/your/dataset.csv" \
+  -F "target_variable=Churn" \
+  -F "max_runtime_secs=300"
+```
+
+**Example using Python:**
+```python
+import requests
+
+url = "http://127.0.0.1:8000/api/model-training/run-h2o-ml-pipeline-advanced"
+# Works with .xlsx, .xls, or .csv files
+files = {'file': open('dataset.xlsx', 'rb')}
+data = {
+    'target_variable': 'Churn',
+    'max_runtime_secs': '300',
+    'model_name': 'gpt-4o-mini',
+    'exclude_columns': 'customerID,unnecessary_column'
+}
+
+response = requests.post(url, files=files, data=data, stream=True)
+for line in response.iter_lines():
+    if line:
+        print(line.decode('utf-8'))
+```
+
+**Response:** Server-sent events stream with real-time training progress
 
 ### Model Interaction
 
@@ -210,13 +253,32 @@ GET /api/v1/dataset/datasets?filename=churn_data.csv&limit=100&offset=0
 
 ## 💡 Usage Examples
 
-### 1. Train a Model
+### 1. Train a Model with File Upload
+
+**With Excel file:**
+```bash
+curl -X POST "http://127.0.0.1:8000/api/model-training/run-h2o-ml-pipeline-advanced" \
+  -F "file=@datasets/customer_churn.xlsx" \
+  -F "target_variable=Churn" \
+  -F "max_runtime_secs=300" \
+  -F "model_name=gpt-4o-mini"
+```
+
+**With CSV file:**
+```bash
+curl -X POST "http://127.0.0.1:8000/api/model-training/run-h2o-ml-pipeline-advanced" \
+  -F "file=@datasets/customer_churn.csv" \
+  -F "target_variable=Churn" \
+  -F "max_runtime_secs=300"
+```
+
+### 2. Train a Model from Existing Dataset
 
 ```bash
 curl -X GET "http://127.0.0.1:8000/api/model-training/run-h2o-ml-pipeline?data_path=datasets/churn_data.csv&target_variable=Churn&max_runtime_secs=300"
 ```
 
-### 2. Chat with a Trained Model
+### 3. Chat with a Trained Model
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/api/model-training/model-chat/your-session-id" \
@@ -226,7 +288,7 @@ curl -X POST "http://127.0.0.1:8000/api/model-training/model-chat/your-session-i
   }'
 ```
 
-### 3. Make a Prediction via Chat
+### 4. Make a Prediction via Chat
 
 ```bash
 curl -X POST "http://127.0.0.1:8000/api/model-training/model-chat/your-session-id" \
@@ -236,7 +298,7 @@ curl -X POST "http://127.0.0.1:8000/api/model-training/model-chat/your-session-i
   }'
 ```
 
-### 4. Get Model Performance
+### 5. Get Model Performance
 
 ```bash
 curl -X GET "http://127.0.0.1:8000/api/model-training/h2o-leaderboard/your-session-id"
@@ -301,6 +363,15 @@ if __name__ == '__main__':
 
 ## 🎯 Key Features Explained
 
+### File Upload
+
+The advanced pipeline endpoint supports direct file upload:
+- Upload `.xlsx`, `.xls`, or `.csv` files
+- Automatic conversion to CSV for H2O processing (Excel files)
+- Validation of target variables and columns
+- Dataset shape information in response
+- Automatic cleanup of temporary files
+
 ### Session-Based Training
 
 Each training run generates a unique session ID that persists:
@@ -309,6 +380,7 @@ Each training run generates a unique session ID that persists:
 - Leaderboard results
 - Training configuration
 - ML recommendations
+- Original filename and dataset shape
 
 This allows you to retrieve results later without keeping H2O sessions active.
 
