@@ -8,6 +8,7 @@ AeroML API provides a comprehensive REST API for building, training, and deployi
 
 ## ✨ Features
 
+- **✅ AI-Powered Dataset Validation**: Validate dataset suitability for ML training using OpenAI GPT-4o-mini
 - **🤖 H2O AutoML Integration**: Automated machine learning pipeline with real-time execution logs
 - **📤 File Upload**: Upload Excel (.xlsx, .xls) or CSV files directly for model training
 - **💬 AI-Powered Chat Interface**: Interact with trained models using natural language (powered by OpenAI)
@@ -83,6 +84,83 @@ Once the server is running, access the interactive API documentation:
 - **ReDoc**: http://127.0.0.1:8000/redoc
 
 ## 🔗 API Endpoints
+
+### Dataset Validation
+
+#### Validate Dataset for Training
+```http
+POST /api/v1/dataset/validate-dataset
+```
+**Content-Type:** `multipart/form-data`
+
+Validates whether a dataset is suitable for machine learning training based on a text prompt describing your intended use case. Uses OpenAI GPT-4o-mini to provide intelligent analysis and recommendations.
+
+**Form Data Parameters:**
+- `file` (required): Dataset file (.xlsx, .xls, or .csv)
+- `prompt` (required): Description of your intended training goal
+
+**Example using cURL:**
+```bash
+curl -X POST "http://127.0.0.1:8000/api/v1/dataset/validate-dataset" \
+  -F "file=@customer_data.xlsx" \
+  -F "prompt=I want to predict customer churn based on usage patterns and demographics"
+```
+
+**Example using Python:**
+```python
+import requests
+
+url = "http://127.0.0.1:8000/api/v1/dataset/validate-dataset"
+files = {'file': open('customer_data.xlsx', 'rb')}
+data = {'prompt': 'I want to predict customer churn based on usage patterns'}
+
+response = requests.post(url, files=files, data=data)
+result = response.json()
+
+print(f"Is Valid: {result['validation']['is_valid']}")
+print(f"Confidence: {result['validation']['confidence_score']}%")
+print(f"Recommendations: {result['validation']['recommendations']}")
+```
+
+**Response Example:**
+```json
+{
+    "status": "success",
+    "dataset_info": {
+        "filename": "customer_data.xlsx",
+        "num_rows": 1000,
+        "num_columns": 12,
+        "columns": ["customer_id", "age", "tenure", "churn", ...]
+    },
+    "validation": {
+        "is_valid": true,
+        "confidence_score": 85,
+        "validation_message": "Dataset appears suitable for customer churn prediction...",
+        "recommendations": [
+            "Handle missing values in 'age' column",
+            "Encode categorical variables",
+            ...
+        ],
+        "suggested_target_column": "churn",
+        "suggested_preprocessing": [...]
+    }
+}
+```
+
+**Features:**
+- ✅ Validates dataset structure and quality
+- ✅ Identifies potential target variables
+- ✅ Provides preprocessing recommendations
+- ✅ Highlights data quality issues
+- ✅ Gives confidence scores
+
+#### Health Check
+```http
+GET /api/v1/dataset/health
+```
+Check if the dataset validation service is running and OpenAI is configured.
+
+---
 
 ### Model Training
 
