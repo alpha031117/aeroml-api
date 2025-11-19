@@ -109,6 +109,27 @@ def run_h2o_ml_pipeline_endpoint(
                 # Final success message
                 yield "LOG: 🎉 H2O ML Pipeline completed successfully!\n"
                 
+                # Extract performance metrics (handle both classification and regression)
+                performance_data = None
+                if results['performance']:
+                    try:
+                        # Try classification metrics
+                        performance_data = {
+                            "auc": float(results['performance'].auc()),
+                            "logloss": float(results['performance'].logloss())
+                        }
+                    except:
+                        # Try regression metrics
+                        try:
+                            performance_data = {
+                                "rmse": float(results['performance'].rmse()),
+                                "mse": float(results['performance'].mse()),
+                                "mae": float(results['performance'].mae()) if hasattr(results['performance'], 'mae') else None
+                            }
+                        except Exception as e:
+                            yield f"LOG: ⚠️ Could not extract performance for storage: {e}\n"
+                            performance_data = {"error": str(e)}
+                
                 # Store session data
                 session_data = {
                     "session_id": session_id,
@@ -121,10 +142,7 @@ def run_h2o_ml_pipeline_endpoint(
                     "model_path": results['model_path'],
                     "leaderboard": results['leaderboard'].to_dict(orient='records') if results['leaderboard'] is not None else None,
                     "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
-                    "performance": {
-                        "auc": float(results['performance'].auc()) if results['performance'] else None,
-                        "logloss": float(results['performance'].logloss()) if results['performance'] else None
-                    } if results['performance'] else None,
+                    "performance": performance_data,
                     "ml_recommendations": ml_recommendations
                 }
                 
@@ -145,15 +163,13 @@ def run_h2o_ml_pipeline_endpoint(
                     "session_id": session_id,
                     "model_path": results['model_path'],
                     "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
-                    "performance": {
-                        "auc": float(results['performance'].auc()) if results['performance'] else None,
-                        "logloss": float(results['performance'].logloss()) if results['performance'] else None
-                    } if results['performance'] else None,
+                    "performance": performance_data,
                     "saved_files": saved_files,
                     "ml_recommendations_available": ml_recommendations is not None
                 }
                 
                 yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
+                yield "STATUS: COMPLETED\n"  # Explicit completion marker for frontend
                 
             else:
                 yield f"LOG: ❌ Pipeline failed: {results['error']}\n"
@@ -183,6 +199,7 @@ def run_h2o_ml_pipeline_endpoint(
                     "session_id": session_id
                 }
                 yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
+                yield "STATUS: FAILED\n"  # Explicit failure marker for frontend
             
             # Cleanup
             # try:
@@ -220,6 +237,7 @@ def run_h2o_ml_pipeline_endpoint(
                 "session_id": session_id
             }
             yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
+            yield "STATUS: ERROR\n"  # Explicit error marker for frontend
     
     return StreamingResponse(generate(), media_type="text/plain")
 
@@ -227,13 +245,6 @@ def run_h2o_ml_pipeline_endpoint(
 async def run_h2o_ml_pipeline_advanced_endpoint(
     file: UploadFile = File(..., description="Dataset file (.xlsx, .xls, or .csv)"),
     target_variable: str = Form(..., description="Target column name"),
-    max_runtime_secs: int = Form(30, description="Maximum training time in seconds"),
-    model_name: str = Form("gpt-4o-mini", description="Model name for AI agent (gpt-4o-mini or gpt-oss:20b)"),
-    user_instructions: Optional[str] = Form(None, description="Custom instructions for the model (optional)"),
-    exclude_columns: Optional[str] = Form(None, description="Comma-separated list of columns to exclude (optional)"),
-    return_predictions: bool = Form(True, description="Return predictions"),
-    return_leaderboard: bool = Form(True, description="Return leaderboard"),
-    return_performance: bool = Form(True, description="Return performance metrics")
 ):
     """
     Run H2O ML pipeline with advanced configuration via POST request.
@@ -245,13 +256,14 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
         filename = file.filename
         if not filename.endswith(('.xlsx', '.xls', '.csv')):
             return {"error": "Only Excel (.xlsx, .xls) or CSV (.csv) files are supported", "status": 400}
+
+        max_runtime_secs = 300
         
         # Parse exclude columns
-        exclude_columns_list = [col.strip() for col in exclude_columns.split(",") if col.strip()] if exclude_columns else []
+        # exclude_columns_list = [col.strip() for col in exclude_columns.split(",") if col.strip()] if exclude_columns else []
         
-        # Set default user instructions if not provided
-        if not user_instructions:
-            user_instructions = f"Please do classification on '{target_variable}'. Use a max runtime of {max_runtime_secs} seconds."
+        # Set default user instructions if not provided (problem type will be auto-detected)
+        user_instructions = f"Please train a model to predict '{target_variable}'. Use a max runtime of {max_runtime_secs} seconds."
         
         # Create temporary directory for uploaded file
         from app.helper.utils import DATASETS_DIR
@@ -289,25 +301,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "status": 400
                 }
             
-            # Validate exclude columns exist
-            if exclude_columns_list:
-                invalid_cols = [col for col in exclude_columns_list if col not in df.columns]
-                if invalid_cols:
-                    return {
-                        "error": f"Exclude columns not found: {', '.join(invalid_cols)}. Available columns: {', '.join(df.columns)}",
-                        "status": 400
-                    }
-            
         except Exception as e:
             return {"error": f"Failed to read file: {str(e)}", "status": 400}
-        
-        # Validate model name
-        if model_name not in ["gpt-oss:20b", "gpt-4o-mini"]:
-            return {"error": "Model name must be 'gpt-oss:20b' or 'gpt-4o-mini'", "status": 400}
-        
-        # Validate max runtime
-        if max_runtime_secs <= 0:
-            return {"error": "Max runtime must be greater than 0", "status": 400}
         
         # Build config
         config = {
@@ -315,12 +310,12 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
             "original_filename": filename,
             "target_variable": target_variable,
             "max_runtime_secs": max_runtime_secs,
-            "model_name": model_name,
+            "model_name": "gpt-4o-mini",
             "user_instructions": user_instructions,
-            "exclude_columns": exclude_columns_list,
-            "return_predictions": return_predictions,
-            "return_leaderboard": return_leaderboard,
-            "return_performance": return_performance
+            "exclude_columns": [],
+            "return_predictions": True,
+            "return_leaderboard": True,
+            "return_performance": True
         }
         
     except Exception as e:
@@ -336,7 +331,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
             yield "LOG: Starting Advanced H2O Machine Learning Pipeline...\n"
             yield f"LOG: Session ID: {session_id}\n"
             yield f"LOG: Uploaded File: {config['original_filename']}\n"
-            yield f"LOG: Dataset Shape: {len(df)} rows × {len(df.columns)} columns\n"
+            yield f"LOG: Dataset Shape: {len(df)} rows x {len(df.columns)} columns\n"
             yield f"LOG: Configuration - Target: {config['target_variable']}, Runtime: {config['max_runtime_secs']}s\n"
             
             # Run the pipeline with custom configuration
@@ -373,9 +368,19 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                 
                 # Model performance summary
                 if results['performance'] is not None:
-                    auc = results['performance'].auc()
-                    logloss = results['performance'].logloss()
-                    yield f"LOG: 📊 Model Performance - AUC: {auc:.4f}, LogLoss: {logloss:.4f}\n"
+                    try:
+                        # Try classification metrics first
+                        auc = results['performance'].auc()
+                        logloss = results['performance'].logloss()
+                        yield f"LOG: 📊 Model Performance - AUC: {auc:.4f}, LogLoss: {logloss:.4f}\n"
+                    except:
+                        # Fall back to regression metrics
+                        try:
+                            rmse = results['performance'].rmse()
+                            mse = results['performance'].mse()
+                            yield f"LOG: 📊 Model Performance - RMSE: {rmse:.4f}, MSE: {mse:.4f}\n"
+                        except Exception as e:
+                            yield f"LOG: ⚠️ Could not extract performance metrics: {e}\n"
                 
                 # Leaderboard summary
                 if results['leaderboard'] is not None:
@@ -387,7 +392,16 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     yield "LOG: Top 3 Models:\n"
                     for idx, row in top_models.iterrows():
                         model_id = row['model_id'][:50] + "..." if len(row['model_id']) > 50 else row['model_id']
-                        yield f"LOG:   {idx+1}. {model_id} - AUC: {row['auc']:.4f}\n"
+                        # Try to show AUC if available (classification), otherwise show RMSE (regression)
+                        try:
+                            if 'auc' in row:
+                                yield f"LOG:   {idx+1}. {model_id} - AUC: {row['auc']:.4f}\n"
+                            elif 'rmse' in row:
+                                yield f"LOG:   {idx+1}. {model_id} - RMSE: {row['rmse']:.4f}\n"
+                            else:
+                                yield f"LOG:   {idx+1}. {model_id}\n"
+                        except:
+                            yield f"LOG:   {idx+1}. {model_id}\n"
                 
                 # Model path
                 if results['model_path']:
@@ -414,6 +428,27 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                 # Final success message
                 yield "LOG: 🎉 Advanced H2O ML Pipeline completed successfully!\n"
                 
+                # Extract performance metrics (handle both classification and regression)
+                performance_data = None
+                if results['performance']:
+                    try:
+                        # Try classification metrics
+                        performance_data = {
+                            "auc": float(results['performance'].auc()),
+                            "logloss": float(results['performance'].logloss())
+                        }
+                    except:
+                        # Try regression metrics
+                        try:
+                            performance_data = {
+                                "rmse": float(results['performance'].rmse()),
+                                "mse": float(results['performance'].mse()),
+                                "mae": float(results['performance'].mae()) if hasattr(results['performance'], 'mae') else None
+                            }
+                        except Exception as e:
+                            yield f"LOG: ⚠️ Could not extract performance for storage: {e}\n"
+                            performance_data = {"error": str(e)}
+                
                 # Store session data
                 session_data = {
                     "session_id": session_id,
@@ -430,10 +465,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "model_path": results['model_path'],
                     "leaderboard": results['leaderboard'].to_dict(orient='records') if results['leaderboard'] is not None else None,
                     "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
-                    "performance": {
-                        "auc": float(results['performance'].auc()) if results['performance'] else None,
-                        "logloss": float(results['performance'].logloss()) if results['performance'] else None
-                    } if results['performance'] else None,
+                    "performance": performance_data,
                     "ml_recommendations": ml_recommendations
                 }
                 
@@ -455,15 +487,13 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "config": config,
                     "model_path": results['model_path'],
                     "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
-                    "performance": {
-                        "auc": float(results['performance'].auc()) if results['performance'] else None,
-                        "logloss": float(results['performance'].logloss()) if results['performance'] else None
-                    } if results['performance'] else None,
+                    "performance": performance_data,  # Use the extracted performance_data
                     "saved_files": saved_files,
                     "ml_recommendations_available": ml_recommendations is not None
                 }
                 
                 yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
+                yield "STATUS: COMPLETED\n"  # Explicit completion marker for frontend
                 
             else:
                 yield f"LOG: ❌ Advanced Pipeline failed: {results['error']}\n"
@@ -497,6 +527,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "config": config
                 }
                 yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
+                yield "STATUS: FAILED\n"  # Explicit failure marker for frontend
             
             # Cleanup
             try:
@@ -549,6 +580,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                 "config": config
             }
             yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
+            yield "STATUS: ERROR\n"  # Explicit error marker for frontend
     
     return StreamingResponse(generate(), media_type="text/plain")
 

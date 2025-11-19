@@ -154,20 +154,52 @@ def run_h2o_ml_pipeline(
         if verbose:
             print("6. Running H2O ML Agent...")
         
+        # Auto-detect problem type (classification vs regression)
+        target_col = training_data[target_variable]
+        is_classification = target_col.dtype == 'object' or target_col.nunique() < 10
+        
+        if verbose:
+            problem_type = "classification" if is_classification else "regression"
+            print(f"   Detected problem type: {problem_type}")
+            print(f"   Target variable '{target_variable}' has {target_col.nunique()} unique values")
+        
+        # Adjust parameters based on problem type
+        if is_classification:
+            # Classification settings
+            if stopping_metric == "logloss":
+                stopping_metric_to_use = "logloss"
+            else:
+                stopping_metric_to_use = stopping_metric
+            balance_classes_to_use = balance_classes
+        else:
+            # Regression settings
+            if stopping_metric == "logloss":
+                stopping_metric_to_use = "RMSE"  # Default for regression
+                if verbose:
+                    print(f"   Adjusted stopping_metric from 'logloss' to 'RMSE' for regression")
+            else:
+                stopping_metric_to_use = stopping_metric
+            balance_classes_to_use = False  # Not applicable for regression
+            if verbose and balance_classes:
+                print(f"   Disabled balance_classes for regression problem")
+        
         # Set default exclude algorithms if not provided
         if exclude_algos is None:
             exclude_algos = ["DeepLearning", "StackedEnsemble"]
         
         # Create enhanced user instructions with AutoML parameters
+        problem_instruction = "classification" if is_classification else "regression"
         enhanced_instructions = f"""
 {user_instructions}
+
+Please do {problem_instruction} on '{target_variable}'. Use a max runtime of {max_runtime_secs} seconds.
 
 Please use the following AutoML parameters for faster training:
 - max_models: {max_models}
 - exclude_algos: {exclude_algos}
 - nfolds: {nfolds}
-- balance_classes: {balance_classes}
-- stopping_metric: {stopping_metric}
+- balance_classes: {balance_classes_to_use}
+- stopping_metric: {stopping_metric_to_use}
 - stopping_tolerance: {stopping_tolerance}
 - stopping_rounds: {stopping_rounds}
 

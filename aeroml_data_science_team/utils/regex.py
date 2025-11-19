@@ -16,29 +16,44 @@ def relocate_imports_inside_function(code_text):
     str
         The modified Python code with imports relocated inside the function.
     """
-    # Match all import statements
-    import_pattern = r'^\s*(import\s+[^\n]+|from\s+\S+\s+import\s+[^\n]+)\s*$'
+    # Match all import statements (including those after comments or empty lines)
+    import_pattern = r'^\s*(import\s+[^\n]+|from\s+[^\n]+\s+import\s+[^\n]+)\s*$'
     imports = re.findall(import_pattern, code_text, re.MULTILINE)
+    
+    if not imports:
+        # No imports found, return original code
+        return code_text
 
-    # Remove imports from the top-level code
-    code_without_imports = re.sub(import_pattern, '', code_text, flags=re.MULTILINE).strip()
+    # Remove imports from the top-level code (but keep comments and empty lines)
+    code_without_imports = re.sub(import_pattern, '', code_text, flags=re.MULTILINE)
+    
+    # Remove excessive blank lines (more than 2 consecutive)
+    code_without_imports = re.sub(r'\n{3,}', '\n\n', code_without_imports).strip()
 
-    # Find the function definition and insert the imports inside it
-    function_pattern = r'(def\s+\w+\s*\(.*?\):)'
-    match = re.search(function_pattern, code_without_imports)
+    # Find the function definition (multi-line support with DOTALL)
+    # This pattern matches: def function_name(...): 
+    # Including multi-line function signatures
+    function_pattern = r'(def\s+\w+\s*\([^)]*\)\s*(?:->.*?)?\s*:)'
+    match = re.search(function_pattern, code_without_imports, re.DOTALL)
 
     if match:
         function_start = match.end()
-        # Insert the imports right after the function definition
-        imports_code = '\n    ' + '\n    '.join(imports)  # Indent imports
-        modified_code = (
-            code_without_imports[:function_start]
-            + imports_code
-            + code_without_imports[function_start:]
-        )
-        return modified_code
+        
+        # Strip leading/trailing whitespace from imports
+        cleaned_imports = [imp.strip() for imp in imports if imp.strip()]
+        
+        # Insert the imports right after the function definition with proper indentation
+        if cleaned_imports:
+            imports_code = '\n    ' + '\n    '.join(cleaned_imports)
+            modified_code = (
+                code_without_imports[:function_start]
+                + imports_code
+                + code_without_imports[function_start:]
+            )
+            return modified_code
 
-    # If no function is found, return the original code
+    # If no function is found, return the code without top-level imports removed
+    # (This shouldn't happen in normal agent usage)
     return code_text
 
 def add_comments_to_top(code_text, agent_name="data_wrangler"):

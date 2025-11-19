@@ -505,6 +505,22 @@ def make_h2o_ml_agent(
                 mlflow_experiment_name: {mlflow_experiment_name}
                 mlflow_run_name: {mlflow_run_name}
 
+            CRITICAL REQUIREMENT - IMPORTS:
+            ALL import statements MUST be placed INSIDE the function definition, not at the top of the file.
+            Required imports (place these at the beginning of the function body):
+                - import h2o
+                - from h2o.automl import H2OAutoML
+                - import pandas as pd
+                - import json
+                - from contextlib import nullcontext  (if not using MLflow)
+                - import mlflow  (only if enable_mlflow is True)
+            
+            CRITICAL REQUIREMENT - TYPE HINTS:
+            DO NOT use pandas type hints (like pd.DataFrame) in the function signature because pandas is imported INSIDE the function.
+            Use simple types or typing module types instead. For example:
+                - Use: data_raw (no type hint)
+                - OR use: data_raw: dict
+                - DO NOT use: data_raw: pd.DataFrame (this will fail!)
 
             Additional Requirements:
             - Convert `data_raw` (pandas DataFrame) into an H2OFrame.
@@ -531,27 +547,27 @@ def make_h2o_ml_agent(
             Return only code in ```python``` with a single function definition. Use this as an example starting template:
             ```python
             def {function_name}(
-                data_raw: List[Dict[str, Any]],
-                target: str,
-                max_runtime_secs: int,
-                exclude_algos: List[str],
-                balance_classes: bool,
-                nfolds: int,
-                seed: int,
-                max_models: int,
-                stopping_metric: str,
-                stopping_tolerance: float,
-                stopping_rounds: int,
-                sort_metric: str ,
-                model_directory: Optional[str] = None,
-                log_path: Optional[str] = None,
-                enable_mlflow: bool, # If use has specified to enable MLflow, make sure to make this True              
-                mlflow_tracking_uri: Optional[str], 
-                mlflow_experiment_name: str,
-                mlflow_run_name: str,
-                **kwargs # Additional parameters for H2OAutoML (feel free to add these based on user instructions and recommended steps)
+                data_raw,  # DO NOT use pd.DataFrame type hint - pandas is imported inside!
+                target: str = None,
+                max_runtime_secs: int = 300,
+                exclude_algos: list = None,
+                balance_classes: bool = True,
+                nfolds: int = 3,
+                seed: int = 42,
+                max_models: int = 10,
+                stopping_metric: str = 'logloss',
+                stopping_tolerance: float = 0.001,
+                stopping_rounds: int = 3,
+                sort_metric: str = 'logloss',
+                model_directory: str = None,
+                log_path: str = None,
+                enable_mlflow: bool = False,
+                mlflow_tracking_uri: str = None, 
+                mlflow_experiment_name: str = 'H2O AutoML',
+                mlflow_run_name: str = None,
+                **kwargs
             ):
-
+                # ALL IMPORTS MUST BE INSIDE THE FUNCTION
                 import h2o
                 from h2o.automl import H2OAutoML
                 import pandas as pd
@@ -571,8 +587,12 @@ def make_h2o_ml_agent(
 
                 exclude_algos = exclude_algos or ["DeepLearning"]  # default if not provided
 
-                # Convert data to DataFrame
-                df = pd.DataFrame(data_raw)
+                # data_raw is already a pandas DataFrame, no need to convert
+                # But if it's a dict, convert it:
+                if isinstance(data_raw, dict):
+                    df = pd.DataFrame(data_raw)
+                else:
+                    df = data_raw
 
                 with run_context as run:
                     # If using MLflow, track run ID
@@ -673,6 +693,8 @@ def make_h2o_ml_agent(
             
             Avoid these errors:
             
+            - name 'pd' is not defined: This happens when you use pd.DataFrame in function signature before importing pandas. Solution: Do NOT use type hints that reference modules imported inside the function (like pd.DataFrame, h2o.H2OFrame, etc.). Just use data_raw without type hint or use simple types.
+            
             - WARNING mlflow.models.model: Model logged without a signature and input example. Please set `input_example` parameter when logging the model to auto infer the model signature.
             
             - 'list' object has no attribute 'tolist'
@@ -682,6 +704,8 @@ def make_h2o_ml_agent(
             - dtype is only supported for one column frames
             
             - h2o.is_running() module 'h2o' has no attribute 'is_running'. Solution: just do h2o.init() and it will check if H2O is running.
+            
+            - Stopping metric cannot be logloss for regression: Use 'RMSE' or 'MSE' for regression problems, not 'logloss'.
             
             
             """,
@@ -797,11 +821,30 @@ def make_h2o_ml_agent(
         You are an H2O AutoML agent. The function {function_name} currently has errors. 
         Please fix it. Return only the corrected function in ```python``` format.
         
+        CRITICAL: Make sure to include ALL necessary imports INSIDE the function definition.
+        Required imports that MUST be included inside the function:
+        - import h2o
+        - from h2o.automl import H2OAutoML
+        - import pandas as pd
+        - import json
+        - from contextlib import nullcontext  (if using MLflow)
+        - import mlflow  (if enable_mlflow is True)
+        
+        Common error: "name 'h2o' is not defined" - This means you forgot to add "import h2o" inside the function.
+        
         Broken code:
         {code_snippet}
 
         Last Known Error:
         {error}
+        
+        Make sure your fixed code has this structure:
+        def {function_name}(...):
+            import h2o
+            from h2o.automl import H2OAutoML
+            import pandas as pd
+            import json
+            # ... rest of the code
         """
         return node_func_fix_agent_code(
             state=state,
