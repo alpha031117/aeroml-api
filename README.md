@@ -13,6 +13,7 @@ AeroML API provides a comprehensive REST API for building, training, and deployi
 - **📤 File Upload**: Upload Excel (.xlsx, .xls) or CSV files directly for model training
 - **💬 AI-Powered Chat Interface**: Interact with trained models using natural language (powered by OpenAI)
 - **📊 Session Management**: Track and retrieve training sessions with unique session IDs
+- **🔐 Private Artifact Storage**: Persist trained models and session files in a private MinIO bucket scoped per user
 - **🎯 Model Deployment**: Easy model deployment with AI-generated test prompts
 - **📈 Performance Metrics**: Detailed model leaderboards and performance reports
 - **🗂️ Dataset Management**: Built-in dataset handling and suggestions
@@ -32,6 +33,8 @@ AeroML API provides a comprehensive REST API for building, training, and deployi
 
 - Python 3.11 or higher
 - OpenAI API key (for chat functionality)
+- Docker Desktop (for local Postgres + MinIO stack)
+- Docker Compose v2
 
 ## 🚀 Installation
 
@@ -60,6 +63,24 @@ pip install -r requirements.txt
 Create a `.env` file in the project root:
 ```env
 OPENAI_API_KEY=your-openai-api-key-here
+
+# Postgres (used for user + session metadata)
+POSTGRES_HOST=localhost
+POSTGRES_PORT=5432
+POSTGRES_DB=aeroml
+POSTGRES_USER=aeroml
+POSTGRES_PASSWORD=change-me-postgres
+
+# MinIO (used for private artifact storage)
+MINIO_ENDPOINT=localhost:9000
+MINIO_ACCESS_KEY=aeroml_local
+MINIO_SECRET_KEY=change-me-super-secret
+MINIO_SECURE=false
+MINIO_MODEL_BUCKET=aeroml-models
+MINIO_SESSION_BUCKET=aeroml-session-data
+
+# OAuth
+GOOGLE_CLIENT_ID=your-google-oauth-client-id.apps.googleusercontent.com
 ```
 
 ## 🏃 Running the Server
@@ -76,6 +97,28 @@ python app/main.py
 
 The server will start at `http://127.0.0.1:8000`
 
+## 🗄️ Local Infrastructure (API + Postgres + MinIO)
+
+The repository now includes a `Dockerfile` and an expanded `docker-compose.local.yml` so you can run the whole stack—API server, Postgres, and MinIO—in one shot:
+
+```bash
+# build images and start everything
+docker compose -f docker-compose.local.yml up --build -d
+```
+
+Services included:
+
+- `api` – builds this repo and runs `uvicorn app.main:app` on `http://localhost:8000`
+- `postgres` – stores users/training-session metadata
+- `minio` – artifact storage (`http://localhost:9001` console)
+- `minio-setup` – seeds the model/session buckets and keeps them private (uses `minio/mc:latest` so you don’t get 404s for missing tags)
+
+The compose file mounts named volumes for the API’s `session_data` and `h2o_models` folders so runs survive container restarts. To stop everything:
+
+```bash
+docker compose -f docker-compose.local.yml down
+```
+
 ## 📚 API Documentation
 
 Once the server is running, access the interactive API documentation:
@@ -84,6 +127,17 @@ Once the server is running, access the interactive API documentation:
 - **ReDoc**: http://127.0.0.1:8000/redoc
 
 ## 🔗 API Endpoints
+
+### User Management
+
+- `POST /api/users/` – register a new user (email + password). Passwords are hashed with Argon2.
+- `POST /api/users/login` – verify credentials and fetch the user profile.
+- `POST /api/users/login/google` – exchange a Google ID token for a session; creates the user on first login.
+- `GET /api/users/{user_id}` – fetch a single user.
+
+The `user_id` returned from these endpoints is required when running training jobs or fetching artifacts so that MinIO objects stay owner-scoped.
+
+> To confirm users are stored in Postgres: `docker exec -it aeroml-postgres psql -U ${POSTGRES_USER:-aeroml} -d ${POSTGRES_DB:-aeroml} -c "select id,email,created_at from users;"`.
 
 ### Dataset Validation
 
@@ -173,8 +227,11 @@ GET /api/model-training/run-h2o-ml-pipeline
 - `target_variable` (string): Target column name
 - `max_runtime_secs` (int): Maximum training time in seconds
 - `model_name` (string, optional): Model name for AI agent
+- `user_id` (string, required): Owner of the training session (must exist in Postgres)
 
 **Response:** Server-sent events stream with real-time training progress
+
+> **Note:** Endpoints that return session artifacts (leaderboard, recommendations, prompt suggestions, chat, etc.) also require the `user_id` query parameter so that the server can verify ownership before downloading from MinIO.
 
 #### Run Advanced H2O ML Pipeline (with File Upload)
 ```http
@@ -185,6 +242,7 @@ POST /api/model-training/run-h2o-ml-pipeline-advanced
 **Form Data Parameters:**
 - `file` (required): Dataset file (.xlsx, .xls, or .csv)
 - `target_variable` (required): Target column name
+- `user_id` (required): Owner of the training session (must exist in Postgres)
 - `max_runtime_secs` (optional): Maximum training time in seconds (default: 30)
 - `model_name` (optional): Model name - "gpt-4o-mini" or "gpt-oss:20b" (default: "gpt-4o-mini")
 - `user_instructions` (optional): Custom instructions for the model

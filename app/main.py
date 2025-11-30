@@ -40,6 +40,8 @@ import uvicorn
 from app.api.dataset_controller import dataset_validation_router
 from app.api.model_training_controller import h2o_router
 from app.api.h2o_utils_controller import h2o_utils_router
+from app.api.user_controller import user_router
+from app.db.database import init_db
 
 def get_application() -> FastAPI:
     application = FastAPI(
@@ -75,11 +77,17 @@ def get_application() -> FastAPI:
     application.include_router(dataset_validation_router, prefix="/api/dataset")
     application.include_router(h2o_router, prefix="/api/model-training")
     application.include_router(h2o_utils_router, prefix="/api/model-training-utils")
+    application.include_router(user_router, prefix="/api/users")
 
     return application
 
 
 app = get_application()
+
+
+@app.on_event("startup")
+def startup_event():
+    init_db()
 
 if __name__ == '__main__':
     uvicorn.run("app.main:app", host="0.0.0.0", port=8000, reload=True, log_level="debug")

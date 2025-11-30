@@ -254,6 +254,31 @@ Focus on faster algorithms like GLM, GBM, and Random Forest for quick results.
         except Exception as e:
             warnings.warn(f"Could not load model: {e}")
         
+        # Fallback: grab leader model if we still don't have one loaded
+        if results['model'] is None and results['leaderboard'] is not None:
+            try:
+                best_row = results['leaderboard'].iloc[0]
+                best_model_id = best_row.get("model_id")
+                if best_model_id:
+                    results['model'] = h2o.get_model(best_model_id)
+                    if verbose:
+                        print(f"   Fallback loaded leader model: {best_model_id}")
+            except Exception as e:
+                warnings.warn(f"Could not load leader model: {e}")
+
+        # Ensure we have a saved model path for artifact uploads
+        if results['model'] is not None and not results.get('model_path'):
+            try:
+                if model_directory is None:
+                    model_directory = os.path.join(os.getcwd(), "h2o_models/")
+                os.makedirs(model_directory, exist_ok=True)
+                saved_path = h2o.save_model(results['model'], path=model_directory, force=True)
+                results['model_path'] = saved_path
+                if verbose:
+                    print(f"   Model saved to: {saved_path}")
+            except Exception as e:
+                warnings.warn(f"Could not save fallback model: {e}")
+
         # 9. Get model performance
         if return_performance and results['model'] is not None:
             try:

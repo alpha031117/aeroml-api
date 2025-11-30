@@ -11,7 +11,7 @@ import operator
 import pandas as pd
 from IPython.display import Markdown
 
-from langchain.prompts import PromptTemplate
+from langchain_core.prompts import PromptTemplate
 from langchain_core.messages import BaseMessage
 
 from langgraph.types import Command, Checkpointer
