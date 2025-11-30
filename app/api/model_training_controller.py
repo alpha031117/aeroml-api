@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, Depends
-from fastapi.responses import StreamingResponse
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks
+from fastapi.responses import StreamingResponse, FileResponse
 import uuid
 from datetime import datetime
 import json
@@ -19,11 +19,23 @@ from app.services.artifact_store import (
     upload_session_artifact,
     download_session_artifact,
     download_model_artifact,
+    download_model_artifact_zip,
+    download_session_artifact_zip,
     list_user_artifacts,
     delete_artifact,
 )
 
 h2o_router = APIRouter(tags=["model-training"])
+
+
+def _cleanup_temp_file(file_path: Path):
+    """Background task to cleanup temporary files after download."""
+    try:
+        if file_path.exists():
+            file_path.unlink()
+            print(f"Cleaned up temporary file: {file_path}")
+    except Exception as e:
+        print(f"Warning: Failed to cleanup temp file {file_path}: {e}")
 
 
 def _get_user_or_404(db: Session, user_id: str):
@@ -854,13 +866,14 @@ def get_h2o_leaderboard(session_id: str, user_id: str, db: Session = Depends(get
 @h2o_router.get("/model-performance/{session_id}")
 def get_model_performance(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
-    Get detailed model performance metrics for a specific H2O training session from local files.
-    
+    Get detailed model performance metrics for a specific H2O training session.
+    Downloads from MinIO if local files are not available.
+
     Parameters:
     -----------
     session_id : str
         The session ID from a previous H2O ML pipeline run
-        
+
     Returns:
     --------
     Dict[str, Any]
@@ -873,19 +886,22 @@ def get_model_performance(session_id: str, user_id: str, db: Session = Depends(g
         - Residual and null deviance
     """
     try:
+        # Ensures session directory exists (downloads from MinIO if needed)
         training_session, session_dir, _, _ = _get_session_context(db, session_id, user_id)
+
+        # Check for performance file
         performance_file = session_dir / "details_performance.json"
-        
         if not performance_file.exists():
             raise HTTPException(
                 status_code=404,
-                detail=f"Performance details not found for session {session_id}"
+                detail=f"Performance details not found for session {session_id}. "
+                       f"The session artifacts may not have been uploaded to MinIO or the training may have failed."
             )
-        
+
         # Load performance data
         with open(performance_file, 'r') as f:
             performance_data = json.load(f)
-        
+
         # Extract key metrics for easy access
         key_metrics = {
             "model_name": performance_data.get("model", {}).get("name"),
@@ -902,8 +918,8 @@ def get_model_performance(session_id: str, user_id: str, db: Session = Depends(g
             "mean_per_class_error": performance_data.get("mean_per_class_error"),
             "nobs": performance_data.get("nobs")
         }
-        
-        # Optionally load session metadata
+
+        # Load session metadata
         session_metadata = {}
         session_file = session_dir / "session_data.json"
         if session_file.exists():
@@ -915,10 +931,11 @@ def get_model_performance(session_id: str, user_id: str, db: Session = Depends(g
                     "target_variable": session_info.get('target_variable'),
                     "data_path": session_info.get('data_path')
                 }
-        
+
         return {
             "session_id": session_id,
             "status": "success",
+            "source": "minio" if training_session.session_object_key else "local_files",
             "key_metrics": key_metrics,
             "full_performance_details": performance_data,
             **session_metadata,
@@ -927,7 +944,7 @@ def get_model_performance(session_id: str, user_id: str, db: Session = Depends(g
                 "session_object_key": training_session.session_object_key,
             },
         }
-        
+
     except HTTPException:
         raise
     except Exception as e:
@@ -939,101 +956,67 @@ def get_model_performance(session_id: str, user_id: str, db: Session = Depends(g
 @h2o_router.get("/h2o-ml-recommendations/{session_id}")
 def get_h2o_ml_recommendations(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
-    Get ML recommendations for a specific H2O training session from local files.
-    
+    Get ML recommendations for a specific H2O training session.
+    Downloads from MinIO if local files are not available.
+
     Parameters:
     -----------
     session_id : str
         The session ID from a previous H2O ML pipeline run
-        
+
     Returns:
     --------
     Dict[str, Any]
         Dictionary containing the ML recommendations and session information
     """
     try:
+        # Ensures session directory exists (downloads from MinIO if needed)
         training_session, session_dir, _, user_uuid = _get_session_context(db, session_id, user_id)
-        
-        if session_dir.exists():
-            # Load ML recommendations from local file
-            recommendations_file = session_dir / "ml_recommendations.txt"
-            if recommendations_file.exists():
-                with open(recommendations_file, 'r', encoding='utf-8') as f:
-                    ml_recommendations = f.read()
-                
-                # Load session metadata
-                session_data = {}
-                session_file = session_dir / "session_data.json"
-                if session_file.exists():
-                    with open(session_file, 'r') as f:
-                        complete_session_data = json.load(f)
-                        session_data.update({
-                            "session_id": complete_session_data.get('session_id'),
-                            "created_at": complete_session_data.get('created_at'),
-                            "status": complete_session_data.get('status'),
-                            "data_path": complete_session_data.get('data_path'),
-                            "target_variable": complete_session_data.get('target_variable'),
-                            "max_runtime_secs": complete_session_data.get('max_runtime_secs'),
-                            "model_name": complete_session_data.get('model_name')
-                        })
-                
-                return {
-                    "session_id": session_id,
-                    "status": "success",
-                    "source": "local_files",
-                    "ml_recommendations": ml_recommendations,
-                    "recommendations_length": len(ml_recommendations),
-                    "created_at": session_data.get('created_at'),
-                    "data_path": session_data.get('data_path'),
-                    "target_variable": session_data.get('target_variable'),
-                    "model_name": session_data.get('model_name'),
-                    "artifacts": {
-                        "model_object_key": training_session.model_object_key,
-                        "session_object_key": training_session.session_object_key,
-                    },
-                }
-            else:
-                return {
-                    "session_id": session_id,
-                    "status": "not_found",
-                    "source": "local_files",
-                    "message": "ML recommendations file not found for this session"
-                }
-        
-        # Fallback: Check memory session data
-        if session_id in h2o_sessions:
-            session_data = h2o_sessions[session_id]
-            
-            if session_data.get('ml_recommendations') and session_data.get("user_id") == str(user_uuid):
-                return {
-                    "session_id": session_id,
-                    "status": "success",
-                    "source": "memory_session_data",
-                    "ml_recommendations": session_data['ml_recommendations'],
-                    "recommendations_length": len(session_data['ml_recommendations']),
-                    "created_at": session_data.get('created_at'),
-                    "data_path": session_data.get('data_path'),
-                    "target_variable": session_data.get('target_variable'),
-                    "model_name": session_data.get('model_name'),
-                    "artifacts": {
-                        "model_object_key": training_session.model_object_key,
-                        "session_object_key": training_session.session_object_key,
-                    },
-                }
-            else:
-                return {
-                    "session_id": session_id,
-                    "status": "not_found",
-                    "source": "memory_session_data",
-                    "message": "ML recommendations not available in memory for this session"
-                }
-        
-        # If not found anywhere, return error
-        raise HTTPException(
-            status_code=404,
-            detail=f"Session {session_id} not found in local files or memory"
-        )
-        
+
+        # Load ML recommendations from file
+        recommendations_file = session_dir / "ml_recommendations.txt"
+        if not recommendations_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"ML recommendations not found for session {session_id}. "
+                       f"The session may not have generated recommendations or artifacts were not uploaded to MinIO."
+            )
+
+        with open(recommendations_file, 'r', encoding='utf-8') as f:
+            ml_recommendations = f.read()
+
+        # Load session metadata
+        session_data = {}
+        session_file = session_dir / "session_data.json"
+        if session_file.exists():
+            with open(session_file, 'r') as f:
+                complete_session_data = json.load(f)
+                session_data.update({
+                    "session_id": complete_session_data.get('session_id'),
+                    "created_at": complete_session_data.get('created_at'),
+                    "status": complete_session_data.get('status'),
+                    "data_path": complete_session_data.get('data_path'),
+                    "target_variable": complete_session_data.get('target_variable'),
+                    "max_runtime_secs": complete_session_data.get('max_runtime_secs'),
+                    "model_name": complete_session_data.get('model_name')
+                })
+
+        return {
+            "session_id": session_id,
+            "status": "success",
+            "source": "minio" if training_session.session_object_key else "local_files",
+            "ml_recommendations": ml_recommendations,
+            "recommendations_length": len(ml_recommendations),
+            "created_at": session_data.get('created_at'),
+            "data_path": session_data.get('data_path'),
+            "target_variable": session_data.get('target_variable'),
+            "model_name": session_data.get('model_name'),
+            "artifacts": {
+                "model_object_key": training_session.model_object_key,
+                "session_object_key": training_session.session_object_key,
+            },
+        }
+
     except HTTPException:
         raise
     except Exception as e:
@@ -1045,31 +1028,55 @@ def get_h2o_ml_recommendations(session_id: str, user_id: str, db: Session = Depe
 @h2o_router.get("/model-info/{session_id}")
 def get_model_info(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
-    Get model info for a specific H2O training session from local files.
+    Get model info for a specific H2O training session.
+    Downloads from MinIO if local files are not available.
+
+    Parameters:
+    -----------
+    session_id : str
+        The session ID from a previous H2O ML pipeline run
+    user_id : str
+        The user ID (must be the owner of the session)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary containing model type and name information
     """
     try:
+        # Ensures session directory exists (downloads from MinIO if needed)
         training_session, session_dir, _, _ = _get_session_context(db, session_id, user_id)
-        # get details performance
+
+        # Get details performance
         details_performance_file = session_dir / "details_performance.json"
-        if details_performance_file.exists():
-            try:
-                with open(details_performance_file, 'r') as f:
-                    details_performance = json.load(f)
-            except Exception as e:
-                return {
-                    "status": "error",
-                    "message": f"Error getting model info for session {session_id}: {str(e)}"
-                }
+        if not details_performance_file.exists():
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model info not found for session {session_id}. "
+                       f"The session artifacts may not have been uploaded to MinIO or the training may have failed."
+            )
+
+        with open(details_performance_file, 'r') as f:
+            details_performance = json.load(f)
+
         return {
-            "session_id": session_id,   
-            "type": details_performance.get('__meta').get('schema_type'),
-            "name": details_performance.get('__meta').get('schema_name')
+            "session_id": session_id,
+            "status": "success",
+            "source": "minio" if training_session.session_object_key else "local_files",
+            "type": details_performance.get('__meta', {}).get('schema_type'),
+            "name": details_performance.get('__meta', {}).get('schema_name'),
+            "artifacts": {
+                "model_object_key": training_session.model_object_key,
+                "session_object_key": training_session.session_object_key,
+            },
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        return {
-            "status": "error",
-            "message": f"Error getting model info for session {session_id}: {str(e)}"
-        }
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error getting model info for session {session_id}: {str(e)}"
+        )
 
 
 
@@ -2092,14 +2099,15 @@ def get_session_artifact_info(session_id: str, user_id: str, db: Session = Depen
         )
 
 
-@h2o_router.post("/artifacts/download-model/{session_id}")
+@h2o_router.get("/artifacts/download-model/{session_id}")
 async def download_model_artifact_endpoint(
     session_id: str,
     user_id: str,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
-    Download a trained model artifact from MinIO.
+    Download a trained model artifact ZIP file directly from MinIO.
     Only available for completed training sessions.
 
     Parameters:
@@ -2111,8 +2119,8 @@ async def download_model_artifact_endpoint(
 
     Returns:
     --------
-    Dict[str, Any]
-        Status information about the download
+    FileResponse
+        ZIP file containing the trained model
     """
     try:
         training_session, _, _, user_uuid = _get_session_context(db, session_id, user_id)
@@ -2131,33 +2139,21 @@ async def download_model_artifact_endpoint(
                        f"Only 'completed' sessions have model artifacts."
             )
 
-        # Download model to temporary location
-        temp_dir = Path("temp_downloads") / str(user_uuid) / session_id
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        # Download model ZIP from MinIO
+        zip_path = download_model_artifact_zip(training_session.model_object_key)
 
-        download_model_artifact(training_session.model_object_key, temp_dir)
+        # Schedule cleanup after file is sent
+        background_tasks.add_task(_cleanup_temp_file, zip_path)
 
-        # Find the extracted model directory
-        model_files = list(temp_dir.glob("*"))
-        if not model_files:
-            raise HTTPException(
-                status_code=500,
-                detail="Failed to extract model artifact"
-            )
-
-        model_dir = model_files[0] if model_files[0].is_dir() else temp_dir
-
-        return {
-            "status": "success",
-            "message": "Model artifact downloaded successfully",
-            "session_id": session_id,
-            "model_artifact_key": training_session.model_object_key,
-            "download_location": str(model_dir),
-            "instructions": {
-                "note": "Model is extracted and ready to use with H2O",
-                "usage": "Use h2o.load_model() to load the downloaded model"
+        # Return ZIP file with proper headers
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"model_{session_id}.zip",
+            headers={
+                "Content-Disposition": f"attachment; filename=model_{session_id}.zip"
             }
-        }
+        )
     except HTTPException:
         raise
     except Exception as e:
@@ -2167,14 +2163,15 @@ async def download_model_artifact_endpoint(
         )
 
 
-@h2o_router.post("/artifacts/download-session/{session_id}")
+@h2o_router.get("/artifacts/download-session/{session_id}")
 async def download_session_artifact_endpoint(
     session_id: str,
     user_id: str,
+    background_tasks: BackgroundTasks,
     db: Session = Depends(get_db)
 ):
     """
-    Download a session artifact from MinIO.
+    Download a session artifact ZIP file directly from MinIO.
     Available for all training sessions (success, failure, or error).
 
     Parameters:
@@ -2186,8 +2183,9 @@ async def download_session_artifact_endpoint(
 
     Returns:
     --------
-    Dict[str, Any]
-        Status information about the download
+    FileResponse
+        ZIP file containing session data (session_data.json, leaderboard.json,
+        details_performance.json, ml_recommendations.txt, prompt_suggestion.json)
     """
     try:
         training_session, _, _, user_uuid = _get_session_context(db, session_id, user_id)
@@ -2198,27 +2196,21 @@ async def download_session_artifact_endpoint(
                 detail=f"No session artifact found for session {session_id}"
             )
 
-        # Download session to temporary location
-        temp_dir = Path("temp_downloads") / str(user_uuid) / session_id / "session"
-        temp_dir.mkdir(parents=True, exist_ok=True)
+        # Download session ZIP from MinIO
+        zip_path = download_session_artifact_zip(training_session.session_object_key)
 
-        download_session_artifact(training_session.session_object_key, temp_dir)
+        # Schedule cleanup after file is sent
+        background_tasks.add_task(_cleanup_temp_file, zip_path)
 
-        return {
-            "status": "success",
-            "message": "Session artifact downloaded successfully",
-            "session_id": session_id,
-            "session_artifact_key": training_session.session_object_key,
-            "training_status": training_session.status,
-            "download_location": str(temp_dir),
-            "contains": [
-                "session_data.json - Complete session information",
-                "leaderboard.json - Model leaderboard",
-                "details_performance.json - Detailed performance metrics",
-                "ml_recommendations.txt - ML recommendations",
-                "prompt_suggestion.json - AI-generated test prompts"
-            ]
-        }
+        # Return ZIP file with proper headers
+        return FileResponse(
+            path=str(zip_path),
+            media_type="application/zip",
+            filename=f"session_{session_id}.zip",
+            headers={
+                "Content-Disposition": f"attachment; filename=session_{session_id}.zip"
+            }
+        )
     except HTTPException:
         raise
     except Exception as e:

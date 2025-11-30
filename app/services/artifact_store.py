@@ -165,6 +165,44 @@ def download_model_artifact(model_object_key: str, destination: Path) -> Path:
     return destination
 
 
+def download_model_artifact_zip(model_object_key: str) -> Path:
+    """Download a model artifact ZIP from MinIO without extracting it."""
+    ensure_bucket(settings.minio_model_bucket)
+    client = get_minio_client()
+
+    temp_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    temp_file.close()
+    temp_zip_path = Path(temp_file.name)
+
+    client.fget_object(
+        bucket_name=settings.minio_model_bucket,
+        object_name=model_object_key,
+        file_path=str(temp_zip_path)
+    )
+
+    logger.info("Downloaded model ZIP artifact %s to %s", model_object_key, temp_zip_path)
+    return temp_zip_path
+
+
+def download_session_artifact_zip(session_object_key: str) -> Path:
+    """Download a session artifact ZIP from MinIO without extracting it."""
+    ensure_bucket(settings.minio_session_bucket)
+    client = get_minio_client()
+
+    temp_file = tempfile.NamedTemporaryFile(suffix=".zip", delete=False)
+    temp_file.close()
+    temp_zip_path = Path(temp_file.name)
+
+    client.fget_object(
+        bucket_name=settings.minio_session_bucket,
+        object_name=session_object_key,
+        file_path=str(temp_zip_path)
+    )
+
+    logger.info("Downloaded session ZIP artifact %s to %s", session_object_key, temp_zip_path)
+    return temp_zip_path
+
+
 def list_user_artifacts(user_id: uuid.UUID) -> dict:
     """List all model and session artifacts for a specific user."""
     ensure_bucket(settings.minio_model_bucket)
