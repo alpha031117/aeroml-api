@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form
+from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import StreamingResponse
 import uuid
 from datetime import datetime
@@ -10,8 +10,72 @@ from app.helper.utils import save_session_data_to_files, h2o_sessions, get_model
 from typing import Dict, Any, Optional
 from pathlib import Path
 from langchain_openai import ChatOpenAI
+from sqlalchemy.orm import Session
+
+from app.db import crud
+from app.db.database import get_db
+from app.services.artifact_store import (
+    upload_model_artifact,
+    upload_session_artifact,
+    download_session_artifact,
+    download_model_artifact,
+    list_user_artifacts,
+    delete_artifact,
+)
 
 h2o_router = APIRouter(tags=["model-training"])
+
+
+def _get_user_or_404(db: Session, user_id: str):
+    try:
+        user_uuid = uuid.UUID(user_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid user_id format")
+
+    user = crud.get_user(db, user_uuid)
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user, user_uuid
+
+
+def _get_training_session_record(db: Session, session_id: str):
+    try:
+        session_uuid = uuid.UUID(session_id)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid session_id format")
+
+    training_session = crud.get_training_session(db, session_uuid)
+    if not training_session:
+        raise HTTPException(status_code=404, detail=f"Session {session_id} not found")
+    return training_session, session_uuid
+
+
+def _get_session_with_access(db: Session, session_id: str, user_id: str):
+    _, user_uuid = _get_user_or_404(db, user_id)
+    training_session, session_uuid = _get_training_session_record(db, session_id)
+    if training_session.user_id != user_uuid:
+        raise HTTPException(status_code=403, detail="Not authorized to access this session")
+    return training_session, session_uuid, user_uuid
+
+
+def _ensure_session_directory(training_session, session_id: str):
+    session_dir = SESSION_DATA_DIR / session_id
+    primary_file = session_dir / "session_data.json"
+    if not primary_file.exists():
+        if training_session.session_object_key:
+            download_session_artifact(training_session.session_object_key, session_dir)
+        else:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No session artifacts available for {session_id}",
+            )
+    return session_dir
+
+
+def _get_session_context(db: Session, session_id: str, user_id: str):
+    training_session, session_uuid, user_uuid = _get_session_with_access(db, session_id, user_id)
+    session_dir = _ensure_session_directory(training_session, session_id)
+    return training_session, session_dir, session_uuid, user_uuid
 
 @h2o_router.get("/run-h2o-ml-pipeline")
 def run_h2o_ml_pipeline_endpoint(
@@ -19,7 +83,9 @@ def run_h2o_ml_pipeline_endpoint(
     data_path: str,
     target_variable: str,
     max_runtime_secs: int,
-    model_name: str = "gpt-oss:20b"
+    model_name: str = "gpt-oss:20b",
+    user_id: str = "",
+    db: Session = Depends(get_db),
 ):
     """
     Run H2O ML pipeline with real-time execution logs.
@@ -27,10 +93,33 @@ def run_h2o_ml_pipeline_endpoint(
     """
     print("🚀 Starting H2O ML Pipeline...")
     
+    if not user_id:
+        raise HTTPException(status_code=400, detail="user_id is required")
+
+    _, user_uuid = _get_user_or_404(db, user_id)
+
     # Generate session ID for this training run
-    session_id = str(uuid.uuid4())
+    session_uuid = uuid.uuid4()
+    session_id = str(session_uuid)
+
+    crud.create_training_session(
+        db,
+        session_id=session_uuid,
+        user_id=user_uuid,
+        status="running",
+        metadata={
+            "data_path": data_path,
+            "target_variable": target_variable,
+            "max_runtime_secs": max_runtime_secs,
+            "model_name": model_name,
+        },
+    )
+
+    model_object_key = None
+    session_object_key = None
     
     def generate():
+        nonlocal model_object_key, session_object_key
         try:
             yield "LOG: Starting H2O Machine Learning Pipeline...\n"
             yield f"LOG: Session ID: {session_id}\n"
@@ -143,7 +232,8 @@ def run_h2o_ml_pipeline_endpoint(
                     "leaderboard": results['leaderboard'].to_dict(orient='records') if results['leaderboard'] is not None else None,
                     "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
                     "performance": performance_data,
-                    "ml_recommendations": ml_recommendations
+                    "ml_recommendations": ml_recommendations,
+                    "user_id": str(user_uuid),
                 }
                 
                 # Store in global session storage
@@ -155,6 +245,22 @@ def run_h2o_ml_pipeline_endpoint(
                     yield f"LOG: 💾 Session data saved to local files:\n"
                     for file_type, file_path in saved_files.items():
                         yield f"LOG:   - {file_type}: {file_path}\n"
+
+                try:
+                    model_object_key = upload_model_artifact(results['model_path'], session_id, user_uuid)
+                    session_object_key = upload_session_artifact(SESSION_DATA_DIR / session_id, session_id, user_uuid)
+                except Exception as artifact_error:
+                    yield f"LOG: ⚠️ Failed to upload artifacts to MinIO: {artifact_error}\n"
+
+                crud.update_training_session(
+                    db,
+                    session_id=session_uuid,
+                    status="completed",
+                    model_object_key=model_object_key,
+                    session_object_key=session_object_key,
+                    performance=performance_data,
+                    metadata=session_data,
+                )
                 
                 # Return final results as JSON
                 final_results = {
@@ -165,7 +271,11 @@ def run_h2o_ml_pipeline_endpoint(
                     "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
                     "performance": performance_data,
                     "saved_files": saved_files,
-                    "ml_recommendations_available": ml_recommendations is not None
+                    "ml_recommendations_available": ml_recommendations is not None,
+                    "artifacts": {
+                        "model_object_key": model_object_key,
+                        "session_object_key": session_object_key,
+                    },
                 }
                 
                 yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
@@ -183,7 +293,8 @@ def run_h2o_ml_pipeline_endpoint(
                     "target_variable": target_variable,
                     "max_runtime_secs": max_runtime_secs,
                     "model_name": model_name,
-                    "error": results['error']
+                    "error": results['error'],
+                    "user_id": str(user_uuid),
                 }
                 
                 # Store in global session storage
@@ -191,12 +302,23 @@ def run_h2o_ml_pipeline_endpoint(
                 
                 # Save failed session data to local files
                 saved_files = save_session_data_to_files(session_id, session_data)
+
+                crud.update_training_session(
+                    db,
+                    session_id=session_uuid,
+                    status="failed",
+                    metadata=session_data,
+                )
                 
                 final_results = {
                     "status": "failed",
                     "error": results['error'],
                     "message": "H2O ML Pipeline failed",
-                    "session_id": session_id
+                    "session_id": session_id,
+                    "artifacts": {
+                        "model_object_key": model_object_key,
+                        "session_object_key": session_object_key,
+                    },
                 }
                 yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
                 yield "STATUS: FAILED\n"  # Explicit failure marker for frontend
@@ -221,7 +343,8 @@ def run_h2o_ml_pipeline_endpoint(
                 "target_variable": target_variable,
                 "max_runtime_secs": max_runtime_secs,
                 "model_name": model_name,
-                "error": str(e)
+                "error": str(e),
+                "user_id": str(user_uuid),
             }
             
             # Store in global session storage
@@ -229,12 +352,23 @@ def run_h2o_ml_pipeline_endpoint(
             
             # Save error session data to local files
             saved_files = save_session_data_to_files(session_id, session_data)
+
+            crud.update_training_session(
+                db,
+                session_id=session_uuid,
+                status="error",
+                metadata=session_data,
+            )
             
             final_results = {
                 "status": "error",
                 "error": str(e),
                 "message": "H2O ML Pipeline encountered an error",
-                "session_id": session_id
+                "session_id": session_id,
+                "artifacts": {
+                    "model_object_key": model_object_key,
+                    "session_object_key": session_object_key,
+                },
             }
             yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
             yield "STATUS: ERROR\n"  # Explicit error marker for frontend
@@ -245,12 +379,19 @@ def run_h2o_ml_pipeline_endpoint(
 async def run_h2o_ml_pipeline_advanced_endpoint(
     file: UploadFile = File(..., description="Dataset file (.xlsx, .xls, or .csv)"),
     target_variable: str = Form(..., description="Target column name"),
+    user_id: str = Form(..., description="Owner of the training session"),
+    db: Session = Depends(get_db),
 ):
     """
     Run H2O ML pipeline with advanced configuration via POST request.
     Accepts multipart/form-data with file upload (Excel or CSV) and configuration parameters.
     Returns real-time execution logs.
     """
+    if not user_id:
+        return {"error": "user_id is required", "status": 400}
+
+    _, user_uuid = _get_user_or_404(db, user_id)
+
     try:
         # Validate file type
         filename = file.filename
@@ -271,7 +412,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
         temp_dir.mkdir(parents=True, exist_ok=True)
         
         # Generate unique filename
-        session_id = str(uuid.uuid4())
+        session_uuid = uuid.uuid4()
+        session_id = str(session_uuid)
         temp_filename = f"temp_{session_id}_{filename}"
         temp_file_path = temp_dir / temp_filename
         
@@ -318,12 +460,29 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
             "return_performance": True
         }
         
+        crud.create_training_session(
+            db,
+            session_id=session_uuid,
+            user_id=user_uuid,
+            status="running",
+            metadata={
+                "original_filename": filename,
+                "target_variable": target_variable,
+                "max_runtime_secs": max_runtime_secs,
+                "model_name": "gpt-4o-mini",
+            },
+        )
+
     except Exception as e:
         return {"error": f"Error parsing request: {str(e)}", "status": 400}
     
     print(f"🚀 Starting Advanced H2O ML Pipeline with uploaded file: {filename}")
     
+    model_object_key = None
+    session_object_key = None
+
     def generate():
+        nonlocal model_object_key, session_object_key
         try:
             # Import the pipeline function
             from h2o_machine_learning_agent.h2o_ml_pipeline import run_h2o_ml_pipeline, shutdown_h2o
@@ -466,7 +625,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "leaderboard": results['leaderboard'].to_dict(orient='records') if results['leaderboard'] is not None else None,
                     "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
                     "performance": performance_data,
-                    "ml_recommendations": ml_recommendations
+                    "ml_recommendations": ml_recommendations,
+                    "user_id": str(user_uuid),
                 }
                 
                 # Store in global session storage
@@ -478,6 +638,22 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     yield f"LOG: 💾 Session data saved to local files:\n"
                     for file_type, file_path in saved_files.items():
                         yield f"LOG:   - {file_type}: {file_path}\n"
+
+                try:
+                    model_object_key = upload_model_artifact(results['model_path'], session_id, user_uuid)
+                    session_object_key = upload_session_artifact(SESSION_DATA_DIR / session_id, session_id, user_uuid)
+                except Exception as artifact_error:
+                    yield f"LOG: ⚠️ Failed to upload artifacts to MinIO: {artifact_error}\n"
+
+                crud.update_training_session(
+                    db,
+                    session_id=session_uuid,
+                    status="completed",
+                    model_object_key=model_object_key,
+                    session_object_key=session_object_key,
+                    performance=performance_data,
+                    metadata=session_data,
+                )
                 
                 # Return final results as JSON
                 final_results = {
@@ -489,7 +665,11 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
                     "performance": performance_data,  # Use the extracted performance_data
                     "saved_files": saved_files,
-                    "ml_recommendations_available": ml_recommendations is not None
+                    "ml_recommendations_available": ml_recommendations is not None,
+                    "artifacts": {
+                        "model_object_key": model_object_key,
+                        "session_object_key": session_object_key,
+                    },
                 }
                 
                 yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
@@ -510,7 +690,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "model_name": config['model_name'],
                     "user_instructions": config['user_instructions'],
                     "exclude_columns": config['exclude_columns'],
-                    "error": results['error']
+                    "error": results['error'],
+                    "user_id": str(user_uuid),
                 }
                 
                 # Store in global session storage
@@ -518,13 +699,24 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                 
                 # Save failed session data to local files
                 saved_files = save_session_data_to_files(session_id, session_data)
+
+                crud.update_training_session(
+                    db,
+                    session_id=session_uuid,
+                    status="failed",
+                    metadata=session_data,
+                )
                 
                 final_results = {
                     "status": "failed",
                     "error": results['error'],
                     "message": "Advanced H2O ML Pipeline failed",
                     "session_id": session_id,
-                    "config": config
+                    "config": config,
+                    "artifacts": {
+                        "model_object_key": model_object_key,
+                        "session_object_key": session_object_key,
+                    },
                 }
                 yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
                 yield "STATUS: FAILED\n"  # Explicit failure marker for frontend
@@ -563,7 +755,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                 "model_name": config.get('model_name'),
                 "user_instructions": config.get('user_instructions'),
                 "exclude_columns": config.get('exclude_columns'),
-                "error": str(e)
+                "error": str(e),
+                "user_id": str(user_uuid),
             }
             
             # Store in global session storage
@@ -571,13 +764,24 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
             
             # Save error session data to local files
             saved_files = save_session_data_to_files(session_id, session_data)
+
+            crud.update_training_session(
+                db,
+                session_id=session_uuid,
+                status="error",
+                metadata=session_data,
+            )
             
             final_results = {
                 "status": "error",
                 "error": str(e),
                 "message": "Advanced H2O ML Pipeline encountered an error",
                 "session_id": session_id,
-                "config": config
+                "config": config,
+                "artifacts": {
+                    "model_object_key": model_object_key,
+                    "session_object_key": session_object_key,
+                },
             }
             yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
             yield "STATUS: ERROR\n"  # Explicit error marker for frontend
@@ -585,7 +789,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
     return StreamingResponse(generate(), media_type="text/plain")
 
 @h2o_router.get("/h2o-leaderboard/{session_id}")
-def get_h2o_leaderboard(session_id: str):
+def get_h2o_leaderboard(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
     Get the model leaderboard for a specific H2O training session from local files.
     
@@ -600,8 +804,7 @@ def get_h2o_leaderboard(session_id: str):
         Dictionary containing the leaderboard data
     """
     try:
-        # Get leaderboard from local file
-        session_dir = SESSION_DATA_DIR / session_id
+        training_session, session_dir, _, _ = _get_session_context(db, session_id, user_id)
         leaderboard_file = session_dir / "leaderboard.json"
         
         if not leaderboard_file.exists():
@@ -633,7 +836,11 @@ def get_h2o_leaderboard(session_id: str):
             "session_id": session_id,
             "status": "success",
             "leaderboard": leaderboard_data,
-            **session_metadata
+            **session_metadata,
+            "artifacts": {
+                "model_object_key": training_session.model_object_key,
+                "session_object_key": training_session.session_object_key,
+            },
         }
         
     except HTTPException:
@@ -645,7 +852,7 @@ def get_h2o_leaderboard(session_id: str):
         )
 
 @h2o_router.get("/model-performance/{session_id}")
-def get_model_performance(session_id: str):
+def get_model_performance(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
     Get detailed model performance metrics for a specific H2O training session from local files.
     
@@ -666,8 +873,7 @@ def get_model_performance(session_id: str):
         - Residual and null deviance
     """
     try:
-        # Get performance details from local file
-        session_dir = SESSION_DATA_DIR / session_id
+        training_session, session_dir, _, _ = _get_session_context(db, session_id, user_id)
         performance_file = session_dir / "details_performance.json"
         
         if not performance_file.exists():
@@ -715,7 +921,11 @@ def get_model_performance(session_id: str):
             "status": "success",
             "key_metrics": key_metrics,
             "full_performance_details": performance_data,
-            **session_metadata
+            **session_metadata,
+            "artifacts": {
+                "model_object_key": training_session.model_object_key,
+                "session_object_key": training_session.session_object_key,
+            },
         }
         
     except HTTPException:
@@ -727,7 +937,7 @@ def get_model_performance(session_id: str):
         )
 
 @h2o_router.get("/h2o-ml-recommendations/{session_id}")
-def get_h2o_ml_recommendations(session_id: str):
+def get_h2o_ml_recommendations(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
     Get ML recommendations for a specific H2O training session from local files.
     
@@ -742,8 +952,7 @@ def get_h2o_ml_recommendations(session_id: str):
         Dictionary containing the ML recommendations and session information
     """
     try:
-        # Try to get ML recommendations from local files first
-        session_dir = SESSION_DATA_DIR / session_id
+        training_session, session_dir, _, user_uuid = _get_session_context(db, session_id, user_id)
         
         if session_dir.exists():
             # Load ML recommendations from local file
@@ -777,7 +986,11 @@ def get_h2o_ml_recommendations(session_id: str):
                     "created_at": session_data.get('created_at'),
                     "data_path": session_data.get('data_path'),
                     "target_variable": session_data.get('target_variable'),
-                    "model_name": session_data.get('model_name')
+                    "model_name": session_data.get('model_name'),
+                    "artifacts": {
+                        "model_object_key": training_session.model_object_key,
+                        "session_object_key": training_session.session_object_key,
+                    },
                 }
             else:
                 return {
@@ -791,7 +1004,7 @@ def get_h2o_ml_recommendations(session_id: str):
         if session_id in h2o_sessions:
             session_data = h2o_sessions[session_id]
             
-            if session_data.get('ml_recommendations'):
+            if session_data.get('ml_recommendations') and session_data.get("user_id") == str(user_uuid):
                 return {
                     "session_id": session_id,
                     "status": "success",
@@ -801,7 +1014,11 @@ def get_h2o_ml_recommendations(session_id: str):
                     "created_at": session_data.get('created_at'),
                     "data_path": session_data.get('data_path'),
                     "target_variable": session_data.get('target_variable'),
-                    "model_name": session_data.get('model_name')
+                    "model_name": session_data.get('model_name'),
+                    "artifacts": {
+                        "model_object_key": training_session.model_object_key,
+                        "session_object_key": training_session.session_object_key,
+                    },
                 }
             else:
                 return {
@@ -826,12 +1043,12 @@ def get_h2o_ml_recommendations(session_id: str):
         )
 
 @h2o_router.get("/model-info/{session_id}")
-def get_model_info(session_id: str):
+def get_model_info(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
     Get model info for a specific H2O training session from local files.
     """
     try:
-        session_dir = SESSION_DATA_DIR / session_id
+        training_session, session_dir, _, _ = _get_session_context(db, session_id, user_id)
         # get details performance
         details_performance_file = session_dir / "details_performance.json"
         if details_performance_file.exists():
@@ -1240,11 +1457,16 @@ class ModelChatBot:
             return f"Prediction result: {prediction}"
 
 @h2o_router.post("/model-chat/{session_id}")
-async def model_chat_endpoint(session_id: str, request: Request):
+async def model_chat_endpoint(session_id: str, request: Request, user_id: str, db: Session = Depends(get_db)):
     """
     Chat with a deployed H2O model using natural language.
     """
     try:
+        if not user_id:
+            return {"error": "user_id is required", "status": 400}
+
+        _get_session_context(db, session_id, user_id)
+
         data = await request.json()
         user_input = data.get("message", "")
         
@@ -1283,12 +1505,17 @@ async def model_chat_endpoint(session_id: str, request: Request):
         }
 
 @h2o_router.get("/model-deployment/{session_id}")
-def model_deployment(session_id: str):
+def model_deployment(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
     Deploy a model for a specific H2O training session and provide chat interface information.
     Includes 5 recommendation prompts for testing the model.
     """
     try:
+        if not user_id:
+            return {"error": "user_id is required", "status": 400}
+
+        training_session, _, _, _ = _get_session_context(db, session_id, user_id)
+
         # Initialize chatbot to get model information
         chatbot = ModelChatBot(session_id)
         init_result = chatbot.initialize()
@@ -1555,6 +1782,11 @@ Make them realistic and specific to the {use_case} domain.
         
         with open(prompt_suggestion_file, 'w', encoding='utf-8') as f:
             json.dump(prompt_data, f, indent=2, default=str)
+
+        try:
+            upload_session_artifact(session_dir, session_id, training_session.user_id)
+        except Exception as artifact_error:
+            print(f"⚠️ Failed to sync prompt suggestions to MinIO: {artifact_error}")
         
         return {
             "session_id": session_id,
@@ -1591,29 +1823,28 @@ Make them realistic and specific to the {use_case} domain.
         }
 
 @h2o_router.get("/prompt-suggestions/{session_id}")
-def get_prompt_suggestions(session_id: str):
+def get_prompt_suggestions(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
     Get the 5 recommendation prompts for testing a specific model from local JSON file.
-    
+
     Parameters:
     -----------
     session_id : str
         The session ID from a previous H2O ML pipeline run
-        
+
     Returns:
     --------
     Dict[str, Any]
         Dictionary containing the recommendation prompts and model information
     """
     try:
-        # Try to get prompt suggestions from local JSON file
-        session_dir = SESSION_DATA_DIR / session_id
+        training_session, session_dir, _, _ = _get_session_context(db, session_id, user_id)
         prompt_suggestion_file = session_dir / "prompt_suggestion.json"
-        
+
         if prompt_suggestion_file.exists():
             with open(prompt_suggestion_file, 'r', encoding='utf-8') as f:
                 prompt_data = json.load(f)
-            
+
             return {
                 "session_id": session_id,
                 "status": "success",
@@ -1631,10 +1862,412 @@ def get_prompt_suggestions(session_id: str):
                 "source": "local_files",
                 "message": "Prompt suggestions file not found. Please run model deployment first."
             }
-        
+
     except Exception as e:
         return {
             "session_id": session_id,
             "status": "error",
             "message": f"Error retrieving prompt suggestions: {str(e)}"
         }
+
+
+# ============================================================================
+# Model History and MinIO Artifact Management Endpoints
+# ============================================================================
+
+@h2o_router.get("/model-history/{user_id}")
+def get_model_history(user_id: str, db: Session = Depends(get_db)):
+    """
+    Get complete model training history for a user with MinIO artifact information.
+    This endpoint displays all training sessions owned by the user for the model history page.
+
+    Parameters:
+    -----------
+    user_id : str
+        The user ID (UUID format)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary containing all training sessions with metadata, artifacts, and performance info
+    """
+    try:
+        _, user_uuid = _get_user_or_404(db, user_id)
+
+        # Get all training sessions for this user from database
+        training_sessions = crud.get_sessions_for_user(db, user_uuid)
+
+        if not training_sessions:
+            return {
+                "status": "success",
+                "user_id": str(user_uuid),
+                "total_sessions": 0,
+                "sessions": [],
+                "message": "No training sessions found for this user"
+            }
+
+        # Build response with session details
+        sessions_list = []
+        for session in training_sessions:
+            session_info = {
+                "session_id": str(session.session_id),
+                "status": session.status,
+                "created_at": session.created_at.isoformat() if session.created_at else None,
+                "updated_at": session.updated_at.isoformat() if session.updated_at else None,
+                "metadata": session.metadata_json,
+                "performance": session.performance,
+                "artifacts": {
+                    "model_object_key": session.model_object_key,
+                    "session_object_key": session.session_object_key,
+                    "has_model": session.model_object_key is not None,
+                    "has_session_data": session.session_object_key is not None
+                },
+                "model_info": {
+                    "target_variable": session.metadata_json.get("target_variable") if session.metadata_json else None,
+                    "original_filename": session.metadata_json.get("original_filename") if session.metadata_json else None,
+                    "model_path": session.metadata_json.get("model_path") if session.metadata_json else None,
+                    "num_models": session.metadata_json.get("num_models") if session.metadata_json else 0,
+                }
+            }
+            sessions_list.append(session_info)
+
+        # Sort by created_at descending (most recent first)
+        sessions_list.sort(key=lambda x: x["created_at"] or "", reverse=True)
+
+        # Count sessions by status
+        status_counts = {}
+        for session in sessions_list:
+            status = session["status"]
+            status_counts[status] = status_counts.get(status, 0) + 1
+
+        return {
+            "status": "success",
+            "user_id": str(user_uuid),
+            "total_sessions": len(sessions_list),
+            "status_counts": status_counts,
+            "sessions": sessions_list,
+            "note": "Only 'completed' sessions have trained model artifacts. All sessions have session data artifacts."
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving model history: {str(e)}"
+        )
+
+
+@h2o_router.get("/artifacts/list")
+def list_user_artifacts_endpoint(user_id: str, db: Session = Depends(get_db)):
+    """
+    List all model and session artifacts available for the authenticated user in MinIO.
+
+    Parameters:
+    -----------
+    user_id : str
+        The user ID (UUID format)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary containing lists of available model and session artifacts with metadata
+    """
+    try:
+        _, user_uuid = _get_user_or_404(db, user_id)
+
+        artifacts = list_user_artifacts(user_uuid)
+
+        return {
+            "status": "success",
+            "user_id": str(user_uuid),
+            "total_models": len(artifacts["models"]),
+            "total_sessions": len(artifacts["sessions"]),
+            "models": artifacts["models"],
+            "sessions": artifacts["sessions"]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error listing artifacts: {str(e)}"
+        )
+
+
+@h2o_router.get("/artifacts/model/{session_id}")
+def get_model_artifact_info(session_id: str, user_id: str, db: Session = Depends(get_db)):
+    """
+    Get information about a trained model artifact in MinIO.
+
+    Parameters:
+    -----------
+    session_id : str
+        The session ID
+    user_id : str
+        The user ID (must be the owner of the session)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary containing model artifact information and metadata from the database
+    """
+    try:
+        training_session, _, _, _ = _get_session_context(db, session_id, user_id)
+
+        if not training_session.model_object_key:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No model artifact found for session {session_id}. "
+                       f"The training session may have failed or not yet completed."
+            )
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "model_object_key": training_session.model_object_key,
+            "training_status": training_session.status,
+            "created_at": training_session.created_at.isoformat() if training_session.created_at else None,
+            "metadata": training_session.metadata_json,
+            "performance": training_session.performance,
+            "instructions": {
+                "note": "Only models from completed training sessions are stored in MinIO",
+                "status_must_be": "completed"
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving model artifact info: {str(e)}"
+        )
+
+
+@h2o_router.get("/artifacts/session/{session_id}")
+def get_session_artifact_info(session_id: str, user_id: str, db: Session = Depends(get_db)):
+    """
+    Get information about a session artifact in MinIO.
+
+    Parameters:
+    -----------
+    session_id : str
+        The session ID
+    user_id : str
+        The user ID (must be the owner of the session)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary containing session artifact information and metadata from the database
+    """
+    try:
+        training_session, _, _, _ = _get_session_context(db, session_id, user_id)
+
+        if not training_session.session_object_key:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No session artifact found for session {session_id}"
+            )
+
+        return {
+            "status": "success",
+            "session_id": session_id,
+            "session_object_key": training_session.session_object_key,
+            "training_status": training_session.status,
+            "created_at": training_session.created_at.isoformat() if training_session.created_at else None,
+            "metadata": training_session.metadata_json,
+            "performance": training_session.performance,
+            "instructions": {
+                "note": "Session artifacts are saved for all training sessions (success, failure, or error)",
+                "includes": ["session_data.json", "leaderboard.json", "details_performance.json", "ml_recommendations.txt", "prompt_suggestion.json"]
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving session artifact info: {str(e)}"
+        )
+
+
+@h2o_router.post("/artifacts/download-model/{session_id}")
+async def download_model_artifact_endpoint(
+    session_id: str,
+    user_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Download a trained model artifact from MinIO.
+    Only available for completed training sessions.
+
+    Parameters:
+    -----------
+    session_id : str
+        The session ID
+    user_id : str
+        The user ID (must be the owner of the session)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Status information about the download
+    """
+    try:
+        training_session, _, _, user_uuid = _get_session_context(db, session_id, user_id)
+
+        if not training_session.model_object_key:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No model artifact found for session {session_id}. "
+                       f"Models are only saved for successfully completed training sessions."
+            )
+
+        if training_session.status != "completed":
+            raise HTTPException(
+                status_code=400,
+                detail=f"Model cannot be downloaded. Training session status is '{training_session.status}'. "
+                       f"Only 'completed' sessions have model artifacts."
+            )
+
+        # Download model to temporary location
+        temp_dir = Path("temp_downloads") / str(user_uuid) / session_id
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        download_model_artifact(training_session.model_object_key, temp_dir)
+
+        # Find the extracted model directory
+        model_files = list(temp_dir.glob("*"))
+        if not model_files:
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to extract model artifact"
+            )
+
+        model_dir = model_files[0] if model_files[0].is_dir() else temp_dir
+
+        return {
+            "status": "success",
+            "message": "Model artifact downloaded successfully",
+            "session_id": session_id,
+            "model_artifact_key": training_session.model_object_key,
+            "download_location": str(model_dir),
+            "instructions": {
+                "note": "Model is extracted and ready to use with H2O",
+                "usage": "Use h2o.load_model() to load the downloaded model"
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error downloading model artifact: {str(e)}"
+        )
+
+
+@h2o_router.post("/artifacts/download-session/{session_id}")
+async def download_session_artifact_endpoint(
+    session_id: str,
+    user_id: str,
+    db: Session = Depends(get_db)
+):
+    """
+    Download a session artifact from MinIO.
+    Available for all training sessions (success, failure, or error).
+
+    Parameters:
+    -----------
+    session_id : str
+        The session ID
+    user_id : str
+        The user ID (must be the owner of the session)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Status information about the download
+    """
+    try:
+        training_session, _, _, user_uuid = _get_session_context(db, session_id, user_id)
+
+        if not training_session.session_object_key:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No session artifact found for session {session_id}"
+            )
+
+        # Download session to temporary location
+        temp_dir = Path("temp_downloads") / str(user_uuid) / session_id / "session"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+
+        download_session_artifact(training_session.session_object_key, temp_dir)
+
+        return {
+            "status": "success",
+            "message": "Session artifact downloaded successfully",
+            "session_id": session_id,
+            "session_artifact_key": training_session.session_object_key,
+            "training_status": training_session.status,
+            "download_location": str(temp_dir),
+            "contains": [
+                "session_data.json - Complete session information",
+                "leaderboard.json - Model leaderboard",
+                "details_performance.json - Detailed performance metrics",
+                "ml_recommendations.txt - ML recommendations",
+                "prompt_suggestion.json - AI-generated test prompts"
+            ]
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error downloading session artifact: {str(e)}"
+        )
+
+
+@h2o_router.get("/artifacts/minio-status")
+def check_minio_status(user_id: str, db: Session = Depends(get_db)):
+    """
+    Check MinIO connection and list user's artifact storage status.
+
+    Parameters:
+    -----------
+    user_id : str
+        The user ID (UUID format)
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Status information about MinIO and user's artifacts
+    """
+    try:
+        _, user_uuid = _get_user_or_404(db, user_id)
+
+        artifacts = list_user_artifacts(user_uuid)
+
+        return {
+            "status": "success",
+            "minio_connection": "healthy",
+            "user_id": str(user_uuid),
+            "storage_summary": {
+                "total_models_stored": len(artifacts["models"]),
+                "total_sessions_stored": len(artifacts["sessions"]),
+                "model_storage_size_mb": sum(m["size"] for m in artifacts["models"]) / (1024 * 1024),
+                "session_storage_size_mb": sum(s["size"] for s in artifacts["sessions"]) / (1024 * 1024)
+            },
+            "notes": {
+                "models_stored_only_on_success": "Models are only saved in MinIO for completed training sessions",
+                "sessions_stored_all_outcomes": "Session data is saved for all outcomes (success, failure, error)",
+                "user_isolation": "Users can only access their own data (user_id isolation in storage paths)"
+            }
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error checking MinIO status: {str(e)}"
+        )

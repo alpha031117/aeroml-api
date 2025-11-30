@@ -1,0 +1,77 @@
+version: "3.9"
+
+services:
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: aeroml-api
+    env_file:
+      - .env
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-aeroml_db}
+      POSTGRES_USER: ${POSTGRES_USER:-aeroml}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      DATABASE_URL: postgresql+psycopg://${POSTGRES_USER:-aeroml}:${POSTGRES_PASSWORD:-password}@postgres:5432/${POSTGRES_DB:-aeroml_db}
+      MINIO_ENDPOINT: minio:9000
+      MINIO_SECURE: "false"
+      MINIO_MODEL_BUCKET: ${MINIO_MODEL_BUCKET:-aeroml-models}
+      MINIO_SESSION_BUCKET: ${MINIO_SESSION_BUCKET:-aeroml-session-data}
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+      - minio
+      - minio-setup
+    volumes:
+      - session_data:/app/session_data
+      - h2o_models:/app/h2o_models
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: aeroml-postgres
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-aeroml_db}
+      POSTGRES_USER: ${POSTGRES_USER:-aeroml}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    container_name: aeroml-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ACCESS_KEY:-aeroml_local}
+      MINIO_ROOT_PASSWORD: ${MINIO_SECRET_KEY:-change-me-super-secret}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  minio-setup:
+    image: minio/mc:latest
+    container_name: aeroml-minio-setup
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c "
+      until mc alias set local http://minio:9000 ${MINIO_ACCESS_KEY:-aeroml_local} ${MINIO_SECRET_KEY:-change-me-super-secret}; do sleep 1; done &&
+      mc mb --ignore-existing local/${MINIO_MODEL_BUCKET:-aeroml-models} &&
+      mc mb --ignore-existing local/${MINIO_SESSION_BUCKET:-aeroml-session-data} &&
+      mc anonymous set private local/${MINIO_MODEL_BUCKET:-aeroml-models} &&
+      mc anonymous set private local/${MINIO_SESSION_BUCKET:-aeroml-session-data}
+      "
+
+volumes:
+  postgres_data:
+  minio_data:
+  session_data:
+  h2o_models:
+
+
