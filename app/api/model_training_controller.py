@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from app.db import crud
 from app.db.database import get_db
+from app.utils.json_utils import clean_json_for_storage
 from app.services.artifact_store import (
     upload_model_artifact,
     upload_session_artifact,
@@ -230,6 +231,10 @@ def run_h2o_ml_pipeline_endpoint(
                         except Exception as e:
                             yield f"LOG: ⚠️ Could not extract performance for storage: {e}\n"
                             performance_data = {"error": str(e)}
+                
+                # Clean NaN/Infinity values from performance_data before storing (PostgreSQL doesn't accept NaN in JSON)
+                if performance_data is not None:
+                    performance_data = clean_json_for_storage(performance_data)
                 
                 # Store session data
                 session_data = {
@@ -619,6 +624,10 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                         except Exception as e:
                             yield f"LOG: ⚠️ Could not extract performance for storage: {e}\n"
                             performance_data = {"error": str(e)}
+                
+                # Clean NaN/Infinity values from performance_data before storing (PostgreSQL doesn't accept NaN in JSON)
+                if performance_data is not None:
+                    performance_data = clean_json_for_storage(performance_data)
                 
                 # Store session data
                 session_data = {

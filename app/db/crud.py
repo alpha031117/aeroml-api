@@ -9,6 +9,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db import models
+from app.utils.json_utils import clean_json_for_storage
 
 
 def get_user(db: Session, user_id: uuid.UUID) -> Optional[models.User]:
@@ -67,14 +68,27 @@ def update_training_session(
     if not training_session:
         return None
 
+    # Clean JSON fields before setting them to avoid PostgreSQL NaN errors
+    cleaned_updates = {}
     for key, value in updates.items():
         if hasattr(training_session, key) and value is not None:
-            setattr(training_session, key, value)
+            # Clean JSON fields to remove NaN/Infinity values that PostgreSQL doesn't accept
+            if key in ("performance", "metadata_json") and isinstance(value, (dict, list)):
+                cleaned_updates[key] = clean_json_for_storage(value)
+            else:
+                cleaned_updates[key] = value
 
-    db.add(training_session)
-    db.commit()
-    db.refresh(training_session)
-    return training_session
+    for key, value in cleaned_updates.items():
+        setattr(training_session, key, value)
+
+    try:
+        db.add(training_session)
+        db.commit()
+        db.refresh(training_session)
+        return training_session
+    except Exception as e:
+        db.rollback()
+        raise
 
 
 def get_sessions_for_user(db: Session, user_id: uuid.UUID) -> List[models.TrainingSession]:
