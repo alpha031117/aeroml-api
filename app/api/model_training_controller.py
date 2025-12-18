@@ -1,16 +1,18 @@
 from fastapi import APIRouter, Request, HTTPException, UploadFile, File, Form, Depends, BackgroundTasks
 from fastapi.responses import StreamingResponse, FileResponse
 import uuid
+import os
 from datetime import datetime
 import json
 import pandas as pd
 import h2o
 from h2o_machine_learning_agent.h2o_ml_pipeline import run_h2o_ml_pipeline, evaluate_model_performance_from_path, predict_with_model
 from app.helper.utils import save_session_data_to_files, h2o_sessions, get_model_path_from_session_data, SESSION_DATA_DIR
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from pathlib import Path
 from langchain_openai import ChatOpenAI
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 
 from app.db import crud
 from app.db.database import get_db
@@ -27,6 +29,114 @@ from app.services.artifact_store import (
 )
 
 h2o_router = APIRouter(tags=["model-training"])
+
+
+class TrainingConfigInput(BaseModel):
+    openai_api_key: str
+    model_name: str
+    max_runtime_secs: int
+
+
+# In-memory training configuration (kept minimal to avoid persisting secrets)
+training_config = {
+    "openai_api_key": None,
+    "model_name": "gpt-4o-mini",
+    "max_runtime_secs": 300,
+    "max_models": 10,
+    "stopping_rounds": 3,
+}
+
+
+class LLMConfigCreate(BaseModel):
+    user_id: str
+    openai_api_key: str
+    model_name: str
+    max_runtime_secs: int
+    max_models: int
+    stopping_rounds: int
+
+
+class LLMConfigRead(BaseModel):
+    id: uuid.UUID
+    model_name: str
+    max_runtime_secs: int
+    max_models: int
+    stopping_rounds: int
+    created_at: datetime
+    openai_api_key_masked: str
+
+
+@h2o_router.post("/training-config")
+def set_training_config(payload: TrainingConfigInput):
+    """
+    Store OpenAI API key, model name, and AutoML max runtime for subsequent training runs.
+    The API key is applied to the current process environment for langchain_openai.
+    """
+    training_config["openai_api_key"] = payload.openai_api_key
+    training_config["model_name"] = payload.model_name
+    training_config["max_runtime_secs"] = payload.max_runtime_secs
+
+    # Set the key so downstream ChatOpenAI calls pick it up immediately
+    os.environ["OPENAI_API_KEY"] = payload.openai_api_key
+
+    return {
+        "model_name": payload.model_name,
+        "max_runtime_secs": payload.max_runtime_secs,
+        "openai_key_set": True,
+    }
+
+
+def _mask_api_key(key: str) -> str:
+    """Return a masked version of the API key for safe display."""
+    if not key:
+        return ""
+    if len(key) <= 6:
+        return "*" * len(key)
+    return f"{'*' * (len(key) - 4)}{key[-4:]}"
+
+
+def _llm_config_to_read(model) -> LLMConfigRead:
+    return LLMConfigRead(
+        id=model.id,
+        model_name=model.model_name,
+        max_runtime_secs=model.max_runtime_secs,
+        max_models=model.max_models,
+        stopping_rounds=model.stopping_rounds,
+        created_at=model.created_at,
+        openai_api_key_masked=_mask_api_key(model.openai_api_key),
+    )
+
+
+@h2o_router.post("/llm-configs", response_model=LLMConfigRead)
+def create_llm_config_endpoint(payload: LLMConfigCreate, db: Session = Depends(get_db)):
+    user, user_uuid = _get_user_or_404(db, payload.user_id)
+
+    record = crud.create_llm_config(
+        db,
+        user_id=user_uuid,
+        openai_api_key=payload.openai_api_key,
+        model_name=payload.model_name,
+        max_runtime_secs=payload.max_runtime_secs,
+        max_models=payload.max_models,
+        stopping_rounds=payload.stopping_rounds,
+    )
+
+    # Update in-memory config and environment for immediate use
+    training_config["openai_api_key"] = payload.openai_api_key
+    training_config["model_name"] = payload.model_name
+    training_config["max_runtime_secs"] = payload.max_runtime_secs
+    training_config["max_models"] = payload.max_models
+    training_config["stopping_rounds"] = payload.stopping_rounds
+    os.environ["OPENAI_API_KEY"] = payload.openai_api_key
+
+    return _llm_config_to_read(record)
+
+
+@h2o_router.get("/llm-configs", response_model=List[LLMConfigRead])
+def list_llm_configs(user_id: str, db: Session = Depends(get_db)):
+    _, user_uuid = _get_user_or_404(db, user_id)
+    records = crud.list_llm_configs(db, user_uuid)
+    return [_llm_config_to_read(r) for r in records]
 
 
 def _cleanup_temp_file(file_path: Path):
@@ -90,308 +200,6 @@ def _get_session_context(db: Session, session_id: str, user_id: str):
     session_dir = _ensure_session_directory(training_session, session_id)
     return training_session, session_dir, session_uuid, user_uuid
 
-@h2o_router.get("/run-h2o-ml-pipeline")
-def run_h2o_ml_pipeline_endpoint(
-    request: Request,
-    data_path: str,
-    target_variable: str,
-    max_runtime_secs: int,
-    model_name: str = "gpt-oss:20b",
-    user_id: str = "",
-    db: Session = Depends(get_db),
-):
-    """
-    Run H2O ML pipeline with real-time execution logs.
-    This endpoint streams the execution progress and results.
-    """
-    print("🚀 Starting H2O ML Pipeline...")
-    
-    if not user_id:
-        raise HTTPException(status_code=400, detail="user_id is required")
-
-    _, user_uuid = _get_user_or_404(db, user_id)
-
-    # Generate session ID for this training run
-    session_uuid = uuid.uuid4()
-    session_id = str(session_uuid)
-
-    crud.create_training_session(
-        db,
-        session_id=session_uuid,
-        user_id=user_uuid,
-        status="running",
-        metadata={
-            "data_path": data_path,
-            "target_variable": target_variable,
-            "max_runtime_secs": max_runtime_secs,
-            "model_name": model_name,
-        },
-    )
-
-    model_object_key = None
-    session_object_key = None
-    
-    def generate():
-        nonlocal model_object_key, session_object_key
-        try:
-            yield "LOG: Starting H2O Machine Learning Pipeline...\n"
-            yield f"LOG: Session ID: {session_id}\n"
-            
-            # Run the pipeline with verbose output
-            results = run_h2o_ml_pipeline(
-                data_path="datasets/churn_data.csv",
-                target_variable="Churn",
-                max_runtime_secs=120,
-                max_models=10,
-                exclude_algos=["DeepLearning"],
-                nfolds=3,
-                verbose=True
-            )
-            
-            # Extract ML recommendations if available
-            ml_recommendations = None
-            if results.get('ml_agent') is not None:
-                try:
-                    ml_recommendations = results['ml_agent'].get_recommended_ml_steps(markdown=False)
-                    yield f"LOG: 📋 ML recommendations extracted\n"
-                except Exception as e:
-                    yield f"LOG: ⚠️ Could not extract ML recommendations: {e}\n"
-        
-            yield "LOG: Pipeline execution completed.\n"
-            
-            # Check results and provide summary
-            if results['status'] == 'completed':
-                yield "LOG: ✅ Pipeline completed successfully!\n"
-                
-                # Model performance summary
-                if results['performance'] is not None:
-                    auc = results['performance'].auc()
-                    logloss = results['performance'].logloss()
-                    yield f"LOG: 📊 Model Performance - AUC: {auc:.4f}, LogLoss: {logloss:.4f}\n"
-                
-                # Leaderboard summary
-                if results['leaderboard'] is not None:
-                    num_models = len(results['leaderboard'])
-                    yield f"LOG: 🏆 Generated {num_models} models in leaderboard\n"
-                    
-                    # Show top 3 models
-                    top_models = results['leaderboard'].head(3)
-                    yield "LOG: Top 3 Models:\n"
-                    for idx, row in top_models.iterrows():
-                        model_id = row['model_id'][:50] + "..." if len(row['model_id']) > 50 else row['model_id']
-                        yield f"LOG:   {idx+1}. {model_id} - AUC: {row['auc']:.4f}\n"
-                
-                # Model path
-                if results['model_path']:
-                    yield f"LOG: 💾 Model saved at: {results['model_path']}\n"
-
-                    # Store model performance to local files
-                    model_performance = evaluate_model_performance_from_path(results['model_path'])
-                    if model_performance:
-                        yield f"LOG: 📊 Model performance saved to local files:\n"
-                        yield f"LOG:   - {model_performance}\n"
-                        # Save detailed performance JSON for later retrieval
-                        try:
-                            session_dir = Path("session_data") / session_id
-                            session_dir.mkdir(parents=True, exist_ok=True)
-                            details_path = session_dir / "details_performance.json"
-                            # Prefer structured JSON if available
-                            details = getattr(model_performance, "_metric_json", None)
-                            if details is None:
-                                # Fallback to string representation
-                                with open(details_path.with_suffix(".txt"), "w", encoding="utf-8") as f:
-                                    f.write(str(model_performance))
-                            else:
-                                with open(details_path, "w", encoding="utf-8") as f:
-                                    json.dump(details, f, indent=2, default=str)
-                            yield f"LOG:   - Detailed performance saved\n"
-                        except Exception as e:
-                            yield f"LOG: ⚠️ Could not save detailed performance: {e}\n"
-                
-                # Final success message
-                yield "LOG: 🎉 H2O ML Pipeline completed successfully!\n"
-                
-                # Extract performance metrics (handle both classification and regression)
-                performance_data = None
-                if results['performance']:
-                    try:
-                        # Try classification metrics
-                        performance_data = {
-                            "auc": float(results['performance'].auc()),
-                            "logloss": float(results['performance'].logloss())
-                        }
-                    except:
-                        # Try regression metrics
-                        try:
-                            performance_data = {
-                                "rmse": float(results['performance'].rmse()),
-                                "mse": float(results['performance'].mse()),
-                                "mae": float(results['performance'].mae()) if hasattr(results['performance'], 'mae') else None
-                            }
-                        except Exception as e:
-                            yield f"LOG: ⚠️ Could not extract performance for storage: {e}\n"
-                            performance_data = {"error": str(e)}
-                
-                # Clean NaN/Infinity values from performance_data before storing (PostgreSQL doesn't accept NaN in JSON)
-                if performance_data is not None:
-                    performance_data = clean_json_for_storage(performance_data)
-                
-                # Store session data
-                session_data = {
-                    "session_id": session_id,
-                    "created_at": datetime.now().isoformat(),
-                    "status": "completed",
-                    "data_path": data_path,
-                    "target_variable": target_variable,
-                    "max_runtime_secs": max_runtime_secs,
-                    "model_name": model_name,
-                    "model_path": results['model_path'],
-                    "leaderboard": results['leaderboard'].to_dict(orient='records') if results['leaderboard'] is not None else None,
-                    "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
-                    "performance": performance_data,
-                    "ml_recommendations": ml_recommendations,
-                    "user_id": str(user_uuid),
-                }
-                
-                # Store in global session storage
-                h2o_sessions[session_id] = session_data
-                
-                # Save session data to local files
-                saved_files = save_session_data_to_files(session_id, session_data)
-                if saved_files:
-                    yield f"LOG: 💾 Session data saved to local files:\n"
-                    for file_type, file_path in saved_files.items():
-                        yield f"LOG:   - {file_type}: {file_path}\n"
-
-                try:
-                    model_object_key = upload_model_artifact(results['model_path'], session_id, user_uuid)
-                    session_object_key = upload_session_artifact(SESSION_DATA_DIR / session_id, session_id, user_uuid)
-                except Exception as artifact_error:
-                    yield f"LOG: ⚠️ Failed to upload artifacts to MinIO: {artifact_error}\n"
-
-                crud.update_training_session(
-                    db,
-                    session_id=session_uuid,
-                    status="completed",
-                    model_object_key=model_object_key,
-                    session_object_key=session_object_key,
-                    performance=performance_data,
-                    metadata=session_data,
-                )
-                
-                # Return final results as JSON
-                final_results = {
-                    "status": "completed",
-                    "message": "H2O ML Pipeline completed successfully",
-                    "session_id": session_id,
-                    "model_path": results['model_path'],
-                    "num_models": len(results['leaderboard']) if results['leaderboard'] is not None else 0,
-                    "performance": performance_data,
-                    "saved_files": saved_files,
-                    "ml_recommendations_available": ml_recommendations is not None,
-                    "artifacts": {
-                        "model_object_key": model_object_key,
-                        "session_object_key": session_object_key,
-                    },
-                }
-                
-                yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
-                yield "STATUS: COMPLETED\n"  # Explicit completion marker for frontend
-                
-            else:
-                yield f"LOG: ❌ Pipeline failed: {results['error']}\n"
-                
-                # Store failed session data
-                session_data = {
-                    "session_id": session_id,
-                    "created_at": datetime.now().isoformat(),
-                    "status": "failed",
-                    "data_path": data_path,
-                    "target_variable": target_variable,
-                    "max_runtime_secs": max_runtime_secs,
-                    "model_name": model_name,
-                    "error": results['error'],
-                    "user_id": str(user_uuid),
-                }
-                
-                # Store in global session storage
-                h2o_sessions[session_id] = session_data
-                
-                # Save failed session data to local files
-                saved_files = save_session_data_to_files(session_id, session_data)
-
-                crud.update_training_session(
-                    db,
-                    session_id=session_uuid,
-                    status="failed",
-                    metadata=session_data,
-                )
-                
-                final_results = {
-                    "status": "failed",
-                    "error": results['error'],
-                    "message": "H2O ML Pipeline failed",
-                    "session_id": session_id,
-                    "artifacts": {
-                        "model_object_key": model_object_key,
-                        "session_object_key": session_object_key,
-                    },
-                }
-                yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
-                yield "STATUS: FAILED\n"  # Explicit failure marker for frontend
-            
-            # Cleanup
-            # try:
-            #     shutdown_h2o()
-            #     yield "LOG: 🧹 H2O cluster shutdown successfully\n"
-            # except Exception as e:
-            #     yield f"LOG: ⚠️ Warning: Could not shutdown H2O cluster: {e}\n"
-                
-        except Exception as e:
-            error_msg = f"🔥 Error in H2O ML Pipeline: {str(e)}"
-            yield f"LOG: {error_msg}\n"
-            
-            # Store error session data
-            session_data = {
-                "session_id": session_id,
-                "created_at": datetime.now().isoformat(),
-                "status": "error",
-                "data_path": data_path,
-                "target_variable": target_variable,
-                "max_runtime_secs": max_runtime_secs,
-                "model_name": model_name,
-                "error": str(e),
-                "user_id": str(user_uuid),
-            }
-            
-            # Store in global session storage
-            h2o_sessions[session_id] = session_data
-            
-            # Save error session data to local files
-            saved_files = save_session_data_to_files(session_id, session_data)
-
-            crud.update_training_session(
-                db,
-                session_id=session_uuid,
-                status="error",
-                metadata=session_data,
-            )
-            
-            final_results = {
-                "status": "error",
-                "error": str(e),
-                "message": "H2O ML Pipeline encountered an error",
-                "session_id": session_id,
-                "artifacts": {
-                    "model_object_key": model_object_key,
-                    "session_object_key": session_object_key,
-                },
-            }
-            yield f"FINAL_RESULT: {json.dumps(final_results, indent=2)}\n"
-            yield "STATUS: ERROR\n"  # Explicit error marker for frontend
-    
-    return StreamingResponse(generate(), media_type="text/plain")
-
 @h2o_router.post("/run-h2o-ml-pipeline-advanced")
 async def run_h2o_ml_pipeline_advanced_endpoint(
     file: UploadFile = File(..., description="Dataset file (.xlsx, .xls, or .csv)"),
@@ -409,13 +217,20 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
 
     _, user_uuid = _get_user_or_404(db, user_id)
 
+    # Apply configured defaults from user's LLM config
+    if training_config.get("openai_api_key"):
+        os.environ["OPENAI_API_KEY"] = training_config["openai_api_key"]
+
+    max_runtime_secs = training_config.get("max_runtime_secs", 300)
+    model_name = training_config.get("model_name", "gpt-4o-mini")
+    max_models = training_config.get("max_models", 10)
+    stopping_rounds = training_config.get("stopping_rounds", 3)
+
     try:
         # Validate file type
         filename = file.filename
         if not filename.endswith(('.xlsx', '.xls', '.csv')):
             return {"error": "Only Excel (.xlsx, .xls) or CSV (.csv) files are supported", "status": 400}
-
-        max_runtime_secs = 300
         
         # Parse exclude columns
         # exclude_columns_list = [col.strip() for col in exclude_columns.split(",") if col.strip()] if exclude_columns else []
@@ -469,7 +284,9 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
             "original_filename": filename,
             "target_variable": target_variable,
             "max_runtime_secs": max_runtime_secs,
-            "model_name": "gpt-4o-mini",
+            "model_name": model_name,
+            "max_models": max_models,
+            "stopping_rounds": stopping_rounds,
             "user_instructions": user_instructions,
             "exclude_columns": [],
             "return_predictions": True,
@@ -486,7 +303,9 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                 "original_filename": filename,
                 "target_variable": target_variable,
                 "max_runtime_secs": max_runtime_secs,
-                "model_name": "gpt-4o-mini",
+                "model_name": model_name,
+                "max_models": max_models,
+                "stopping_rounds": stopping_rounds,
             },
         )
 
@@ -518,7 +337,11 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                 user_instructions=config["user_instructions"],
                 model_name=config["model_name"],
                 max_runtime_secs=config["max_runtime_secs"],
+                max_models=config["max_models"],
+                stopping_rounds=config["stopping_rounds"],
                 exclude_columns=config["exclude_columns"],
+                exclude_algos=["DeepLearning"],
+                nfolds=3,
                 log_enabled=True,
                 return_model=True,
                 return_predictions=config["return_predictions"],
@@ -640,6 +463,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "target_variable": config['target_variable'],
                     "max_runtime_secs": config['max_runtime_secs'],
                     "model_name": config['model_name'],
+                    "max_models": config['max_models'],
+                    "stopping_rounds": config['stopping_rounds'],
                     "user_instructions": config['user_instructions'],
                     "exclude_columns": config['exclude_columns'],
                     "model_path": results['model_path'],
@@ -709,6 +534,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                     "target_variable": config['target_variable'],
                     "max_runtime_secs": config['max_runtime_secs'],
                     "model_name": config['model_name'],
+                    "max_models": config.get('max_models'),
+                    "stopping_rounds": config.get('stopping_rounds'),
                     "user_instructions": config['user_instructions'],
                     "exclude_columns": config['exclude_columns'],
                     "error": results['error'],
@@ -774,6 +601,8 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
                 "target_variable": config.get('target_variable'),
                 "max_runtime_secs": config.get('max_runtime_secs'),
                 "model_name": config.get('model_name'),
+                "max_models": config.get('max_models'),
+                "stopping_rounds": config.get('stopping_rounds'),
                 "user_instructions": config.get('user_instructions'),
                 "exclude_columns": config.get('exclude_columns'),
                 "error": str(e),

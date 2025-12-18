@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
 import pandas as pd
@@ -6,6 +6,11 @@ import json
 import io
 from typing import Optional
 import os
+import uuid
+from sqlalchemy.orm import Session
+
+from app.db import crud
+from app.db.database import get_db
 
 dataset_validation_router = APIRouter(tags=["dataset-validation"])
 
@@ -14,6 +19,8 @@ dataset_validation_router = APIRouter(tags=["dataset-validation"])
 async def validate_dataset(
     file: UploadFile = File(..., description="Dataset file (.xlsx, .xls, or .csv)"),
     prompt: str = Form(..., description="Text prompt describing the intended use of the dataset"),
+    user_id: str = Form(..., description="User ID to fetch LLM configuration"),
+    db: Session = Depends(get_db),
 ):
     """
     Validates if a dataset is suitable for training based on the provided prompt.
@@ -22,12 +29,13 @@ async def validate_dataset(
     1. Accepts an Excel/CSV file containing the dataset
     2. Accepts a text prompt describing the intended model/training goal
     3. Analyzes the dataset structure and content
-    4. Uses OpenAI (gpt-4o-mini) to validate if the dataset is appropriate for the described task
+    4. Uses OpenAI (from user's LLM config) to validate if the dataset is appropriate for the described task
     5. Returns detailed validation results and recommendations
     
     Args:
         file: The dataset file (Excel .xlsx, .xls, or CSV .csv)
         prompt: Text description of the intended training task
+        user_id: User ID to fetch LLM configuration
         
     Returns:
         JSON response containing:
@@ -37,6 +45,28 @@ async def validate_dataset(
         - recommendations: Suggestions for improvement (if any)
     """
     try:
+        # Validate and get user_id
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid user_id format"
+            )
+        
+        # Get user's LLM config
+        llm_configs = crud.list_llm_configs(db, user_uuid)
+        if not llm_configs:
+            raise HTTPException(
+                status_code=404,
+                detail="No LLM configuration found for this user. Please create an LLM config first."
+            )
+        
+        # Use the most recent LLM config
+        llm_config = llm_configs[0]
+        openai_api_key = llm_config.openai_api_key
+        model_name = llm_config.model_name
+        
         # Validate file type
         filename = file.filename
         if not filename.endswith(('.xlsx', '.xls', '.csv')):
@@ -147,11 +177,11 @@ async def validate_dataset(
 
         Respond ONLY with the JSON object, no additional text."""
 
-        # Initialize OpenAI with gpt-4o-mini
+        # Initialize OpenAI with user's LLM config
         llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model=model_name,
             temperature=0.3,  # Lower temperature for more consistent validation
-            api_key=os.getenv("OPENAI_API_KEY")
+            api_key=openai_api_key
         )
         
         # Call OpenAI to validate the dataset

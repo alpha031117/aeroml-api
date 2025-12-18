@@ -30,6 +30,13 @@ class UserLogin(BaseModel):
     password: str
 
 
+class UserUpdate(BaseModel):
+    email: Optional[EmailStr] = None
+    password: Optional[str] = Field(None, min_length=8)
+    full_name: Optional[str] = None
+    is_active: Optional[bool] = None
+
+
 class GoogleLogin(BaseModel):
     id_token: str = Field(..., description="Google ID token obtained on the client")
 
@@ -100,4 +107,34 @@ def get_user(user_id: uuid.UUID, db: Session = Depends(get_db)):
     if not user:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
     return user
+
+
+@user_router.put("/{user_id}", response_model=UserRead)
+def update_user(user_id: uuid.UUID, payload: UserUpdate, db: Session = Depends(get_db)):
+    user = crud.get_user(db, user_id)
+    if not user:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    if payload.email and payload.email != user.email:
+        existing = crud.get_user_by_email(db, payload.email)
+        if existing and existing.id != user_id:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already registered",
+            )
+
+    hashed_pw = hash_password(payload.password) if payload.password else None
+    updated = crud.update_user(
+        db,
+        user_id=user_id,
+        email=payload.email,
+        hashed_password=hashed_pw,
+        full_name=payload.full_name,
+        is_active=payload.is_active,
+    )
+
+    if not updated:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="User not found")
+
+    return updated
 
