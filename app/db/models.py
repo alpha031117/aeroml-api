@@ -38,3 +38,15 @@ class TrainingSession(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
 
 
+class LLMConfig(Base):
+    __tablename__ = "llm_configs"
+
+    id = Column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
+    user_id = Column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False, index=True)
+    openai_api_key = Column(String(512), nullable=False)
+    model_name = Column(String(255), nullable=False)
+    max_runtime_secs = Column(Integer, nullable=False)
+    max_models = Column(Integer, nullable=False)
+    stopping_rounds = Column(Integer, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+

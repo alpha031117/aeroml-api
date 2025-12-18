@@ -21,6 +21,40 @@ def get_user_by_email(db: Session, email: str) -> Optional[models.User]:
     return db.execute(stmt).scalar_one_or_none()
 
 
+def update_user(
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    email: Optional[str] = None,
+    hashed_password: Optional[str] = None,
+    full_name: Optional[str] = None,
+    is_active: Optional[bool] = None,
+) -> Optional[models.User]:
+    user = get_user(db, user_id)
+    if not user:
+        return None
+
+    updates = {
+        "email": email,
+        "hashed_password": hashed_password,
+        "full_name": full_name,
+        "is_active": is_active,
+    }
+
+    for key, value in updates.items():
+        if value is not None:
+            setattr(user, key, value)
+
+    try:
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        return user
+    except Exception:
+        db.rollback()
+        raise
+
+
 def create_user(db: Session, *, email: str, hashed_password: str, full_name: Optional[str] = None) -> models.User:
     user = models.User(email=email, hashed_password=hashed_password, full_name=full_name)
     db.add(user)
@@ -108,5 +142,38 @@ def delete_training_session(db: Session, session_id: uuid.UUID) -> bool:
     db.delete(training_session)
     db.commit()
     return True
+
+
+def create_llm_config(
+    db: Session,
+    *,
+    user_id: uuid.UUID,
+    openai_api_key: str,
+    model_name: str,
+    max_runtime_secs: int,
+    max_models: int,
+    stopping_rounds: int,
+) -> models.LLMConfig:
+    llm_config = models.LLMConfig(
+        user_id=user_id,
+        openai_api_key=openai_api_key,
+        model_name=model_name,
+        max_runtime_secs=max_runtime_secs,
+        max_models=max_models,
+        stopping_rounds=stopping_rounds,
+    )
+    db.add(llm_config)
+    db.commit()
+    db.refresh(llm_config)
+    return llm_config
+
+
+def list_llm_configs(db: Session, user_id: uuid.UUID) -> List[models.LLMConfig]:
+    stmt = (
+        select(models.LLMConfig)
+        .where(models.LLMConfig.user_id == user_id)
+        .order_by(models.LLMConfig.created_at.desc())
+    )
+    return db.execute(stmt).scalars().all()
 
 

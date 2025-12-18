@@ -1,4 +1,4 @@
-from fastapi import APIRouter, UploadFile, File, Form, HTTPException
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
 from fastapi.responses import JSONResponse
 from langchain_openai import ChatOpenAI
 import pandas as pd
@@ -6,6 +6,11 @@ import json
 import io
 from typing import Optional
 import os
+import uuid
+from sqlalchemy.orm import Session
+
+from app.db import crud
+from app.db.database import get_db
 
 dataset_validation_router = APIRouter(tags=["dataset-validation"])
 
@@ -14,6 +19,8 @@ dataset_validation_router = APIRouter(tags=["dataset-validation"])
 async def validate_dataset(
     file: UploadFile = File(..., description="Dataset file (.xlsx, .xls, or .csv)"),
     prompt: str = Form(..., description="Text prompt describing the intended use of the dataset"),
+    user_id: str = Form(..., description="User ID to fetch LLM configuration"),
+    db: Session = Depends(get_db),
 ):
     """
     Validates if a dataset is suitable for training based on the provided prompt.
@@ -22,12 +29,13 @@ async def validate_dataset(
     1. Accepts an Excel/CSV file containing the dataset
     2. Accepts a text prompt describing the intended model/training goal
     3. Analyzes the dataset structure and content
-    4. Uses OpenAI (gpt-4o-mini) to validate if the dataset is appropriate for the described task
+    4. Uses OpenAI (from user's LLM config) to validate if the dataset is appropriate for the described task
     5. Returns detailed validation results and recommendations
     
     Args:
         file: The dataset file (Excel .xlsx, .xls, or CSV .csv)
         prompt: Text description of the intended training task
+        user_id: User ID to fetch LLM configuration
         
     Returns:
         JSON response containing:
@@ -37,6 +45,28 @@ async def validate_dataset(
         - recommendations: Suggestions for improvement (if any)
     """
     try:
+        # Validate and get user_id
+        try:
+            user_uuid = uuid.UUID(user_id)
+        except ValueError:
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid user_id format"
+            )
+        
+        # Get user's LLM config
+        llm_configs = crud.list_llm_configs(db, user_uuid)
+        if not llm_configs:
+            raise HTTPException(
+                status_code=404,
+                detail="No LLM configuration found for this user. Please create an LLM config first."
+            )
+        
+        # Use the most recent LLM config
+        llm_config = llm_configs[0]
+        openai_api_key = llm_config.openai_api_key
+        model_name = llm_config.model_name
+        
         # Validate file type
         filename = file.filename
         if not filename.endswith(('.xlsx', '.xls', '.csv')):
@@ -91,7 +121,7 @@ async def validate_dataset(
         if len(numeric_cols) > 0:
             dataset_info["summary_statistics"] = df[numeric_cols].describe().to_dict()
         
-        # Prepare the validation prompt for OpenAI
+        # Prepare the validation prompt for OpenAI with leakage detection
         validation_prompt = f"""You are an expert data scientist tasked with validating whether a dataset is suitable for a specific machine learning task.
 
         **User's Training Goal:**
@@ -113,7 +143,21 @@ async def validate_dataset(
         {json.dumps(dataset_info['sample_data'], indent=2)}
 
         **Your Task:**
-        Please analyze this dataset and determine if it is suitable for the described training goal. Provide your response in the following JSON format:
+        Please analyze this dataset and determine if it is suitable for the described training goal.
+
+        **CRITICAL: Data Leakage Detection**
+        Identify any columns that would cause data leakage. Data leakage occurs when:
+        1. A feature is derived from or calculated from the target variable
+        2. A feature contains future information that wouldn't be available at prediction time
+        3. A feature is a proxy or direct encoding of the target
+        4. A feature contains the outcome/result being predicted
+
+        **Examples of Leakage:**
+        - If target is "Sales_Classification" (High/Low), then "Sales_Volume" is leaky (classification is derived from volume)
+        - If target is "Churn", then "Account_Closed_Date" is leaky (only known after churn)
+        - If target is "Loan_Default", then "Final_Payment_Status" is leaky (same as target)
+
+        Provide your response in the following JSON format:
 
         {{
             "is_valid": true/false,
@@ -134,7 +178,18 @@ async def validate_dataset(
                 "Preprocessing step 1",
                 "Preprocessing step 2",
                 ...
-            ]
+            ],
+            "leaky_columns": [
+                {{
+                    "column_name": "Name of the leaky column",
+                    "reason": "Detailed explanation of why this column causes data leakage",
+                    "severity": "high|medium|low",
+                    "recommendation": "What to do about this column (exclude, transform, etc.)"
+                }},
+                ...
+            ],
+            "columns_to_exclude": ["column1", "column2"],
+            "safe_columns": ["column1", "column2"]
         }}
 
         Focus on:
@@ -142,16 +197,19 @@ async def validate_dataset(
         2. Data quality (missing values, data types, etc.)
         3. Dataset size adequacy
         4. Potential target variable identification
-        5. Any data preprocessing needs
-        6. Any critical issues that would prevent training
+        5. **DATA LEAKAGE DETECTION** (most critical!)
+        6. Any data preprocessing needs
+        7. Any critical issues that would prevent training
+
+        Be conservative with leakage detection - it's better to flag a suspicious column than miss real leakage.
 
         Respond ONLY with the JSON object, no additional text."""
 
-        # Initialize OpenAI with gpt-4o-mini
+        # Initialize OpenAI with user's LLM config
         llm = ChatOpenAI(
-            model="gpt-4o-mini",
+            model=model_name,
             temperature=0.3,  # Lower temperature for more consistent validation
-            api_key=os.getenv("OPENAI_API_KEY")
+            api_key=openai_api_key
         )
         
         # Call OpenAI to validate the dataset
@@ -180,7 +238,10 @@ async def validate_dataset(
                 "recommendations": ["Please try again or contact support"],
                 "potential_issues": ["Unable to validate dataset"],
                 "suggested_target_column": None,
-                "suggested_preprocessing": []
+                "suggested_preprocessing": [],
+                "leaky_columns": [],
+                "columns_to_exclude": [],
+                "safe_columns": []
             }
         except Exception as e:
             raise HTTPException(
@@ -188,7 +249,12 @@ async def validate_dataset(
                 detail=f"Error calling OpenAI: {str(e)}"
             )
         
-        # Prepare the final response
+        # Extract leakage detection information
+        leaky_columns = validation_result.get("leaky_columns", [])
+        columns_to_exclude = validation_result.get("columns_to_exclude", [])
+        safe_columns = validation_result.get("safe_columns", [])
+
+        # Prepare the final response with prominent leakage information
         final_response = {
             "status": "success",
             "dataset_info": {
@@ -198,9 +264,21 @@ async def validate_dataset(
                 "columns": dataset_info["columns"],
                 "missing_values": dataset_info["missing_values"]
             },
-            "validation": validation_result
+            "validation": validation_result,
+            "leakage_detection": {
+                "has_leakage": len(leaky_columns) > 0,
+                "num_leaky_columns": len(leaky_columns),
+                "leaky_columns_details": leaky_columns,
+                "columns_to_exclude": columns_to_exclude,
+                "safe_columns": safe_columns,
+                "warning_message": (
+                    f"⚠️ DETECTED {len(leaky_columns)} POTENTIALLY LEAKY COLUMN(S). "
+                    f"These will be automatically excluded during training to prevent unrealistic model performance (AUC=1.0)."
+                    if len(leaky_columns) > 0 else "✅ No obvious data leakage detected."
+                )
+            }
         }
-        
+
         return JSONResponse(content=final_response, status_code=200)
         
     except HTTPException:

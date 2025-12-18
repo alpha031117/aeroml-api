@@ -1,9 +1,20 @@
-# ============================================================================
-# MinIO Artifact Retrieval Endpoints
-# These endpoints should be added to the h2o_router in model_training_controller.py
-# ============================================================================
+from fastapi import APIRouter, HTTPException, Depends
+from sqlalchemy.orm import Session
+from pathlib import Path
+from app.db.database import get_db
+from app.services.artifact_store import (
+    list_user_artifacts,
+    download_model_artifact,
+    download_session_artifact,
+)
+from app.api.model_training_controller import (
+    _get_user_or_404,
+    _get_session_context,
+)
 
-# @h2o_router.get("/artifacts/list")
+model_training_router = APIRouter(tags=["model-training"])
+
+@model_training_router.get("/artifacts/list")
 def list_user_artifacts_endpoint(user_id: str, db: Session = Depends(get_db)):
     """
     List all model and session artifacts available for the authenticated user in MinIO.
@@ -40,7 +51,7 @@ def list_user_artifacts_endpoint(user_id: str, db: Session = Depends(get_db)):
         )
 
 
-# @h2o_router.get("/artifacts/model/{session_id}")
+@model_training_router.get("/artifacts/model/{session_id}")
 def get_model_artifact_info(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
     Get information about a trained model artifact in MinIO.
@@ -89,7 +100,7 @@ def get_model_artifact_info(session_id: str, user_id: str, db: Session = Depends
         )
 
 
-# @h2o_router.get("/artifacts/session/{session_id}")
+@model_training_router.get("/artifacts/session/{session_id}")
 def get_session_artifact_info(session_id: str, user_id: str, db: Session = Depends(get_db)):
     """
     Get information about a session artifact in MinIO.

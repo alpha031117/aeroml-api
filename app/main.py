@@ -77,7 +77,7 @@ def get_application() -> FastAPI:
     application.include_router(dataset_validation_router, prefix="/api/dataset")
     application.include_router(h2o_router, prefix="/api/model-training")
     application.include_router(h2o_utils_router, prefix="/api/model-training-utils")
-    application.include_router(user_router, prefix="/api/users")
+    application.include_router(user_router, prefix="/api/v1/users")
 
     return application
 
