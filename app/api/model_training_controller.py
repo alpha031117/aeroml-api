@@ -205,6 +205,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
     file: UploadFile = File(..., description="Dataset file (.xlsx, .xls, or .csv)"),
     target_variable: str = Form(..., description="Target column name"),
     user_id: str = Form(..., description="Owner of the training session"),
+    exclude_columns: Optional[str] = Form(None, description="Comma-separated list of columns to exclude (from validation leakage detection)"),
     db: Session = Depends(get_db),
 ):
     """
@@ -279,6 +280,13 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
             return {"error": f"Failed to read file: {str(e)}", "status": 400}
         
         # Build config
+        # Parse exclude_columns from the request (comma-separated string from validation)
+        exclude_columns_list = []
+        if exclude_columns:
+            # Parse comma-separated string
+            exclude_columns_list = [col.strip() for col in exclude_columns.split(",") if col.strip()]
+            print(f"📋 Excluding columns (from validation leakage detection): {exclude_columns_list}")
+
         config = {
             "data_path": str(csv_file_path),
             "original_filename": filename,
@@ -288,7 +296,7 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
             "max_models": max_models,
             "stopping_rounds": stopping_rounds,
             "user_instructions": user_instructions,
-            "exclude_columns": [],
+            "exclude_columns": exclude_columns_list,
             "return_predictions": True,
             "return_leaderboard": True,
             "return_performance": True
@@ -332,7 +340,6 @@ async def run_h2o_ml_pipeline_advanced_endpoint(
             # Run the pipeline with custom configuration
             results = run_h2o_ml_pipeline(
                 data_path=config["data_path"],
-                config_path="config/credentials.yml",
                 target_variable=config["target_variable"],
                 user_instructions=config["user_instructions"],
                 model_name=config["model_name"],

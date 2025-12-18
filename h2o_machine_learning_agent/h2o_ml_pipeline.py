@@ -4,12 +4,105 @@ import pandas as pd
 import h2o
 from langchain_openai import ChatOpenAI
 from aeroml_data_science_team.ml_agents import H2OMLAgent
-from typing import Optional, Dict, Any, Tuple
+from typing import Optional, Dict, Any, Tuple, List
 import warnings
+import numpy as np
+
+
+def detect_data_leakage(
+    df: pd.DataFrame,
+    target_variable: str,
+    correlation_threshold: float = 0.99,
+    verbose: bool = True
+) -> Dict[str, Any]:
+    """
+    Detect potential data leakage by finding columns highly correlated with the target.
+
+    Parameters:
+    -----------
+    df : pd.DataFrame
+        The dataframe to check
+    target_variable : str
+        Name of the target variable
+    correlation_threshold : float
+        Correlation threshold above which to flag potential leakage (default 0.99)
+    verbose : bool
+        Whether to print warnings
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary containing:
+        - 'leaky_columns': List of columns that may cause data leakage
+        - 'correlations': Dictionary of column names to correlation values
+        - 'has_leakage': Boolean indicating if potential leakage detected
+    """
+    leaky_columns = []
+    correlations = {}
+
+    try:
+        # Get target column
+        if target_variable not in df.columns:
+            return {'leaky_columns': [], 'correlations': {}, 'has_leakage': False, 'error': 'Target not found'}
+
+        target = df[target_variable]
+
+        # For classification targets, encode them numerically for correlation
+        if target.dtype == 'object':
+            from sklearn.preprocessing import LabelEncoder
+            le = LabelEncoder()
+            target_encoded = le.fit_transform(target)
+        else:
+            target_encoded = target
+
+        # Check correlation with each numeric column
+        for col in df.columns:
+            if col == target_variable:
+                continue
+
+            try:
+                # For numeric columns, calculate correlation directly
+                if pd.api.types.is_numeric_dtype(df[col]):
+                    corr = np.corrcoef(df[col].fillna(0), target_encoded)[0, 1]
+                    correlations[col] = abs(corr)
+
+                    if abs(corr) >= correlation_threshold:
+                        leaky_columns.append(col)
+                        if verbose:
+                            print(f"   ⚠️  WARNING: Column '{col}' has correlation {abs(corr):.4f} with target - potential data leakage!")
+
+                # For categorical columns, check if it's essentially a duplicate of target
+                elif df[col].dtype == 'object':
+                    # Check if column has same cardinality as target
+                    if df[col].nunique() == target.nunique():
+                        # Check if there's one-to-one mapping
+                        mapping_check = df.groupby(col)[target_variable].nunique().max()
+                        if mapping_check == 1:
+                            leaky_columns.append(col)
+                            correlations[col] = 1.0
+                            if verbose:
+                                print(f"   ⚠️  WARNING: Column '{col}' has one-to-one mapping with target - potential data leakage!")
+
+            except Exception as e:
+                # Skip columns that can't be correlated
+                continue
+
+        has_leakage = len(leaky_columns) > 0
+
+        return {
+            'leaky_columns': leaky_columns,
+            'correlations': correlations,
+            'has_leakage': has_leakage
+        }
+
+    except Exception as e:
+        if verbose:
+            print(f"   Warning: Could not complete data leakage detection: {e}")
+        return {'leaky_columns': [], 'correlations': {}, 'has_leakage': False, 'error': str(e)}
+
 
 def run_h2o_ml_pipeline(
     data_path: str = "datasets/churn_data.csv",
-    config_path: str = "config/credentials.yml",
     target_variable: str = "Churn",
     user_instructions: str = "Please do classification on 'Churn'. Use a max runtime of 30 seconds.",
     model_name: str = "gpt-4o-mini",
@@ -30,18 +123,19 @@ def run_h2o_ml_pipeline(
     balance_classes: bool = True,
     stopping_metric: str = "logloss",
     stopping_tolerance: float = 0.001,
-    stopping_rounds: int = 3
+    stopping_rounds: int = 3,
+    # Data leakage prevention
+    auto_exclude_leaky_columns: bool = False,
+    leakage_correlation_threshold: float = 0.95  # Lowered from 0.99 to catch more potential leaks
 ) -> Dict[str, Any]:
     """
     Run a complete H2O machine learning pipeline including data loading, model training,
     evaluation, and prediction.
-    
+
     Parameters:
     -----------
     data_path : str
         Path to the CSV data file
-    config_path : str
-        Path to the credentials configuration file
     target_variable : str
         Name of the target variable for prediction
     user_instructions : str
@@ -57,7 +151,7 @@ def run_h2o_ml_pipeline(
     model_directory : str, optional
         Directory for saving models (defaults to "h2o_models/")
     exclude_columns : list, optional
-        Columns to exclude from the dataset
+        Non-predictive columns to exclude (e.g., ID columns). Do NOT include target variable.
     return_model : bool
         Whether to return the trained model
     return_predictions : bool
@@ -68,7 +162,25 @@ def run_h2o_ml_pipeline(
         Whether to return model performance metrics
     verbose : bool
         Whether to print progress information
-    
+    max_models : int
+        Maximum number of models to train in AutoML
+    exclude_algos : list, optional
+        Algorithms to exclude from AutoML training
+    nfolds : int
+        Number of cross-validation folds
+    balance_classes : bool
+        Whether to balance classes for classification problems
+    stopping_metric : str
+        Metric to use for early stopping
+    stopping_tolerance : float
+        Tolerance for early stopping
+    stopping_rounds : int
+        Number of rounds for early stopping
+    auto_exclude_leaky_columns : bool
+        Whether to automatically exclude columns that may cause data leakage (default: False)
+    leakage_correlation_threshold : float
+        Correlation threshold for detecting leaky columns (default: 0.95, lowered for better detection)
+
     Returns:
     --------
     Dict[str, Any]
@@ -80,6 +192,7 @@ def run_h2o_ml_pipeline(
         - 'ml_agent': The H2O ML agent instance
         - 'model_path': Path to the saved model
         - 'data': The processed dataset
+        - 'leakage_check': Results of data leakage detection
         - 'status': Pipeline execution status
     """
     
@@ -143,21 +256,93 @@ def run_h2o_ml_pipeline(
         # 5. Prepare data for training
         if verbose:
             print("5. Preparing data for training...")
-        
-        # Remove excluded columns
+
+        # Validate target variable exists in dataset
+        if target_variable not in df.columns:
+            raise ValueError(f"Target variable '{target_variable}' not found in dataset. Available columns: {list(df.columns)}")
+
+        # Auto-detect problem type (classification vs regression)
+        target_col = df[target_variable]
+        is_classification = target_col.dtype == 'object' or target_col.nunique() < 10
+
+        # Handle column exclusion logic
+        # IMPORTANT: We only exclude non-predictive columns (like IDs), NOT the target variable
+        # H2O needs the target variable in the data for training
         if exclude_columns is None:
-            exclude_columns = [df.columns[0]]  # Exclude first column by default
-        
-        training_data = df.drop(columns=exclude_columns)
-        
+            exclude_columns = [df.columns[0]]  # Exclude first column by default (usually ID)
+
+        # Ensure exclude_columns is a list
+        if not isinstance(exclude_columns, list):
+            exclude_columns = list(exclude_columns)
+
+        # CRITICAL: Ensure target variable is NOT in exclude_columns
+        # H2O requires the target to be present in the data for training
+        if target_variable in exclude_columns:
+            exclude_columns = [col for col in exclude_columns if col != target_variable]
+            if verbose:
+                print(f"   Removed '{target_variable}' from exclude_columns - target must be present in data")
+
+        # Validate that we're not excluding the target variable
+        columns_to_exclude = [col for col in exclude_columns if col in df.columns]
+        if target_variable in columns_to_exclude:
+            raise ValueError(
+                f"CRITICAL ERROR: Target variable '{target_variable}' cannot be excluded from the dataset! "
+                f"H2O requires the target variable to be present in the data for training."
+            )
+
+        # Create training data by excluding only non-predictive columns (keeping target)
+        training_data = df.drop(columns=columns_to_exclude)
+
+        # Validate that target variable IS present in training data
+        if target_variable not in training_data.columns:
+            raise ValueError(
+                f"CRITICAL ERROR: Target variable '{target_variable}' is missing from training data! "
+                f"H2O requires the target variable to be present. "
+                f"Excluded columns: {columns_to_exclude}"
+            )
+
+        if verbose:
+            print(f"   Training data shape: {training_data.shape[0]} rows, {training_data.shape[1]} columns")
+            print(f"   Target variable '{target_variable}' is present in the data")
+            print(f"   Excluded columns (non-predictive): {columns_to_exclude}")
+            num_features = training_data.shape[1] - 1  # Subtract 1 for target
+            print(f"   Number of feature columns: {num_features}")
+
+        # 5.5. Check for data leakage
+        if verbose:
+            print("5.5. Checking for potential data leakage...")
+
+        leakage_check = detect_data_leakage(
+            training_data,
+            target_variable,
+            correlation_threshold=leakage_correlation_threshold,
+            verbose=verbose
+        )
+        results['leakage_check'] = leakage_check
+
+        if leakage_check.get('has_leakage', False):
+            leaky_cols = leakage_check.get('leaky_columns', [])
+            if verbose:
+                print(f"   ⚠️  DETECTED {len(leaky_cols)} POTENTIALLY LEAKY COLUMN(S): {leaky_cols}")
+                print(f"   These columns may cause unrealistic model performance (AUC close to 1.0)")
+
+            if auto_exclude_leaky_columns:
+                training_data = training_data.drop(columns=leaky_cols)
+                if verbose:
+                    print(f"   ✅ Automatically excluded leaky columns: {leaky_cols}")
+                    print(f"   Updated training data shape: {training_data.shape[0]} rows, {training_data.shape[1]} columns")
+            else:
+                if verbose:
+                    print(f"   ℹ️  Set auto_exclude_leaky_columns=True to automatically remove these columns")
+        else:
+            if verbose:
+                print(f"   ✅ No obvious data leakage detected")
+
         # 6. Run the ML Agent
         if verbose:
             print("6. Running H2O ML Agent...")
         
-        # Auto-detect problem type (classification vs regression)
-        target_col = training_data[target_variable]
-        is_classification = target_col.dtype == 'object' or target_col.nunique() < 10
-        
+        # Problem type already detected above (line 152)
         if verbose:
             problem_type = "classification" if is_classification else "regression"
             print(f"   Detected problem type: {problem_type}")
@@ -282,10 +467,72 @@ Focus on faster algorithms like GLM, GBM, and Random Forest for quick results.
         # 9. Get model performance
         if return_performance and results['model'] is not None:
             try:
-                performance = results['model'].model_performance()
-                results['performance'] = performance
-                if verbose:
-                    print("   Model performance metrics retrieved")
+                # CRITICAL: Get cross-validation performance, NOT training performance
+                # Training performance will be overly optimistic (often AUC=1.0)
+                model = results['model']
+
+                # Try to get cross-validation metrics first (most reliable)
+                try:
+                    xval_performance = model.cross_validation_metrics_summary()
+                    results['performance_xval'] = xval_performance
+                    if verbose:
+                        print("   ✅ Cross-validation performance metrics retrieved (MOST RELIABLE)")
+                except:
+                    if verbose:
+                        print("   ⚠️  Cross-validation metrics not available")
+
+                # Get training performance (for reference only - will be optimistic)
+                train_performance = model.model_performance(train=True)
+                results['performance_train'] = train_performance
+
+                # Try to get validation performance if available
+                try:
+                    valid_performance = model.model_performance(valid=True)
+                    results['performance_valid'] = valid_performance
+                    if verbose:
+                        print("   ✅ Validation performance metrics retrieved")
+                except:
+                    if verbose:
+                        print("   ⚠️  Validation metrics not available (no separate validation set)")
+
+                # Set the default 'performance' to xval if available, otherwise validation, otherwise training
+                if 'performance_xval' in results:
+                    results['performance'] = results['performance_xval']
+                    results['performance_type'] = 'cross_validation'
+                    if verbose:
+                        print("   📊 Using cross-validation metrics as primary performance (recommended)")
+                elif 'performance_valid' in results:
+                    results['performance'] = results['performance_valid']
+                    results['performance_type'] = 'validation'
+                    if verbose:
+                        print("   📊 Using validation metrics as primary performance")
+                else:
+                    results['performance'] = train_performance
+                    results['performance_type'] = 'training'
+                    if verbose:
+                        print("   ⚠️  WARNING: Only training metrics available - these will be overly optimistic!")
+                        print("   ⚠️  Consider using cross-validation (nfolds > 0) for realistic metrics")
+
+                # Display performance summary
+                if verbose and results.get('performance'):
+                    print(f"\n   === Model Performance Summary ({results['performance_type']}) ===")
+                    try:
+                        perf = results['performance']
+                        if hasattr(perf, 'auc') and callable(perf.auc):
+                            auc_val = perf.auc()
+                            print(f"   AUC: {auc_val:.4f}")
+
+                            # Warning for suspiciously high AUC
+                            if auc_val >= 0.99:
+                                print(f"   ⚠️⚠️⚠️  SUSPICIOUS: AUC >= 0.99 suggests data leakage!")
+                                print(f"   This is likely NOT a realistic model performance.")
+                                print(f"   Check for:")
+                                print(f"     - Columns highly correlated with target")
+                                print(f"     - Future information in features")
+                                print(f"     - Duplicated target column")
+                    except:
+                        pass
+
             except Exception as e:
                 warnings.warn(f"Could not get model performance: {e}")
         
@@ -323,6 +570,78 @@ Focus on faster algorithms like GLM, GBM, and Random Forest for quick results.
         if verbose:
             print(f"=== Pipeline Failed: {e} ===")
         return results
+
+
+def get_user_displayable_metrics(results: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    Extract realistic, user-displayable performance metrics from pipeline results.
+
+    This function prioritizes cross-validation or validation metrics over training metrics
+    to avoid showing overly optimistic performance to users.
+
+    Parameters:
+    -----------
+    results : Dict[str, Any]
+        Results dictionary from run_h2o_ml_pipeline()
+
+    Returns:
+    --------
+    Dict[str, Any]
+        Dictionary containing:
+        - 'metrics': The actual performance metrics to display
+        - 'metric_type': Type of metrics ('cross_validation', 'validation', or 'training')
+        - 'is_reliable': Boolean indicating if metrics are reliable
+        - 'warning': Warning message if metrics are unreliable
+        - 'display_auc': AUC value safe to show to users (or None)
+    """
+    output = {
+        'metrics': None,
+        'metric_type': results.get('performance_type', 'unknown'),
+        'is_reliable': False,
+        'warning': None,
+        'display_auc': None
+    }
+
+    # Check if we have performance results
+    if not results.get('performance'):
+        output['warning'] = "No performance metrics available"
+        return output
+
+    # Get the performance type
+    metric_type = results.get('performance_type', 'unknown')
+    perf = results.get('performance')
+
+    # Extract AUC if available
+    try:
+        if hasattr(perf, 'auc') and callable(perf.auc):
+            auc_val = perf.auc()
+        else:
+            # Handle summary format
+            auc_val = None
+    except:
+        auc_val = None
+
+    # Determine reliability based on metric type and AUC value
+    if metric_type == 'cross_validation':
+        output['is_reliable'] = True
+        output['display_auc'] = auc_val
+        if auc_val and auc_val >= 0.99:
+            output['warning'] = "AUC ≥ 0.99 suggests data leakage. Investigate before deploying."
+            output['is_reliable'] = False
+    elif metric_type == 'validation':
+        output['is_reliable'] = True
+        output['display_auc'] = auc_val
+        if auc_val and auc_val >= 0.99:
+            output['warning'] = "AUC ≥ 0.99 suggests data leakage. Investigate before deploying."
+            output['is_reliable'] = False
+    else:  # training
+        output['is_reliable'] = False
+        output['warning'] = "Only training metrics available - DO NOT show to users. These are overly optimistic."
+        output['display_auc'] = None  # Don't display training AUC
+
+    output['metrics'] = perf
+
+    return output
 
 
 def get_ml_recommendations(ml_agent: H2OMLAgent, markdown: bool = True) -> str:

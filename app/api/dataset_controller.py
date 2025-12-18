@@ -121,7 +121,7 @@ async def validate_dataset(
         if len(numeric_cols) > 0:
             dataset_info["summary_statistics"] = df[numeric_cols].describe().to_dict()
         
-        # Prepare the validation prompt for OpenAI
+        # Prepare the validation prompt for OpenAI with leakage detection
         validation_prompt = f"""You are an expert data scientist tasked with validating whether a dataset is suitable for a specific machine learning task.
 
         **User's Training Goal:**
@@ -143,7 +143,21 @@ async def validate_dataset(
         {json.dumps(dataset_info['sample_data'], indent=2)}
 
         **Your Task:**
-        Please analyze this dataset and determine if it is suitable for the described training goal. Provide your response in the following JSON format:
+        Please analyze this dataset and determine if it is suitable for the described training goal.
+
+        **CRITICAL: Data Leakage Detection**
+        Identify any columns that would cause data leakage. Data leakage occurs when:
+        1. A feature is derived from or calculated from the target variable
+        2. A feature contains future information that wouldn't be available at prediction time
+        3. A feature is a proxy or direct encoding of the target
+        4. A feature contains the outcome/result being predicted
+
+        **Examples of Leakage:**
+        - If target is "Sales_Classification" (High/Low), then "Sales_Volume" is leaky (classification is derived from volume)
+        - If target is "Churn", then "Account_Closed_Date" is leaky (only known after churn)
+        - If target is "Loan_Default", then "Final_Payment_Status" is leaky (same as target)
+
+        Provide your response in the following JSON format:
 
         {{
             "is_valid": true/false,
@@ -164,7 +178,18 @@ async def validate_dataset(
                 "Preprocessing step 1",
                 "Preprocessing step 2",
                 ...
-            ]
+            ],
+            "leaky_columns": [
+                {{
+                    "column_name": "Name of the leaky column",
+                    "reason": "Detailed explanation of why this column causes data leakage",
+                    "severity": "high|medium|low",
+                    "recommendation": "What to do about this column (exclude, transform, etc.)"
+                }},
+                ...
+            ],
+            "columns_to_exclude": ["column1", "column2"],
+            "safe_columns": ["column1", "column2"]
         }}
 
         Focus on:
@@ -172,8 +197,11 @@ async def validate_dataset(
         2. Data quality (missing values, data types, etc.)
         3. Dataset size adequacy
         4. Potential target variable identification
-        5. Any data preprocessing needs
-        6. Any critical issues that would prevent training
+        5. **DATA LEAKAGE DETECTION** (most critical!)
+        6. Any data preprocessing needs
+        7. Any critical issues that would prevent training
+
+        Be conservative with leakage detection - it's better to flag a suspicious column than miss real leakage.
 
         Respond ONLY with the JSON object, no additional text."""
 
@@ -210,7 +238,10 @@ async def validate_dataset(
                 "recommendations": ["Please try again or contact support"],
                 "potential_issues": ["Unable to validate dataset"],
                 "suggested_target_column": None,
-                "suggested_preprocessing": []
+                "suggested_preprocessing": [],
+                "leaky_columns": [],
+                "columns_to_exclude": [],
+                "safe_columns": []
             }
         except Exception as e:
             raise HTTPException(
@@ -218,7 +249,12 @@ async def validate_dataset(
                 detail=f"Error calling OpenAI: {str(e)}"
             )
         
-        # Prepare the final response
+        # Extract leakage detection information
+        leaky_columns = validation_result.get("leaky_columns", [])
+        columns_to_exclude = validation_result.get("columns_to_exclude", [])
+        safe_columns = validation_result.get("safe_columns", [])
+
+        # Prepare the final response with prominent leakage information
         final_response = {
             "status": "success",
             "dataset_info": {
@@ -228,9 +264,21 @@ async def validate_dataset(
                 "columns": dataset_info["columns"],
                 "missing_values": dataset_info["missing_values"]
             },
-            "validation": validation_result
+            "validation": validation_result,
+            "leakage_detection": {
+                "has_leakage": len(leaky_columns) > 0,
+                "num_leaky_columns": len(leaky_columns),
+                "leaky_columns_details": leaky_columns,
+                "columns_to_exclude": columns_to_exclude,
+                "safe_columns": safe_columns,
+                "warning_message": (
+                    f"⚠️ DETECTED {len(leaky_columns)} POTENTIALLY LEAKY COLUMN(S). "
+                    f"These will be automatically excluded during training to prevent unrealistic model performance (AUC=1.0)."
+                    if len(leaky_columns) > 0 else "✅ No obvious data leakage detected."
+                )
+            }
         }
-        
+
         return JSONResponse(content=final_response, status_code=200)
         
     except HTTPException:
