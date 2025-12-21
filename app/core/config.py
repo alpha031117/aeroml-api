@@ -40,6 +40,13 @@ class Settings:
     minio_session_bucket: str
     database_url: str
     google_client_id: str
+    google_client_secret: str
+    google_redirect_uri: str
+    jwt_secret_key: str
+    jwt_algorithm: str
+    jwt_access_token_expires_minutes: int
+    jwt_cookie_name: str
+    frontend_url: str
 
 
 @lru_cache(maxsize=1)
@@ -55,6 +62,20 @@ def get_settings() -> Settings:
         minio_session_bucket=os.getenv("MINIO_SESSION_BUCKET", "aeroml-session-data"),
         database_url=os.getenv("DATABASE_URL") or _build_database_url(),
         google_client_id=os.getenv("GOOGLE_CLIENT_ID", ""),
+        google_client_secret=os.getenv("GOOGLE_CLIENT_SECRET", ""),
+        # Defaults target local backend callback; override in production via env.
+        google_redirect_uri=os.getenv(
+            "GOOGLE_REDIRECT_URI",
+            "http://localhost:8000/api/v1/auth/google/callback",
+        ),
+        jwt_secret_key=os.getenv("JWT_SECRET_KEY", "change-me-in-production"),
+        jwt_algorithm=os.getenv("JWT_ALGORITHM", "HS256"),
+        jwt_access_token_expires_minutes=int(
+            os.getenv("JWT_ACCESS_TOKEN_EXPIRES_MINUTES", "60")
+        ),
+        jwt_cookie_name=os.getenv("JWT_COOKIE_NAME", "access_token"),
+        # Frontend base URL (e.g., http://localhost:3000) - will append /model-prompt for OAuth redirect
+        frontend_url=os.getenv("FRONTEND_URL", "http://localhost:3000"),
     )
 
 
