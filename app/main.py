@@ -60,15 +60,19 @@ def get_application() -> FastAPI:
     if sys.platform.startswith("win"):
         asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
-    # Allow CORS for specific origin
+    # Allow CORS for specific origins
     origins = [
-        "http://localhost:3000",  # React frontend
-        "http://127.0.0.1:80",   # If you want to allow backend to frontend communication
+        "http://localhost:3000",      # React frontend (local dev)
+        "http://127.0.0.1:80",        # Backend to frontend communication (local)
+        "http://aeroml.online",       # Production frontend
+        "https://aeroml.online",      # Production frontend (HTTPS)
+        "http://api.aeroml.online",   # Production API
+        "https://api.aeroml.online",  # Production API (HTTPS)
     ]
         
     application.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
